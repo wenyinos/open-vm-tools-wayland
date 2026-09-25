@@ -115,6 +115,10 @@ if HAVE_WAYLAND
 libdndcp_la_CPPFLAGS += @WAYLAND_CFLAGS@
 libdndcp_la_LIBADD += @WAYLAND_LIBS@
 
+# The Wayland backend is built for both the GTK3 and the GTK4 configuration.
+# It owns the selection through ext-data-control-v1 and falls back to the X
+# selection where the compositor does not implement it. On that fallback it
+# watches the selection through GdkClipboard in GTK4 and GtkClipboard in GTK3.
 libdndcp_la_SOURCES += copyPasteDnDWayland.cpp
 libdndcp_la_SOURCES += copyPasteUIWayland.cpp
 libdndcp_la_SOURCES += waylandClipboard/waylandClipboard.c

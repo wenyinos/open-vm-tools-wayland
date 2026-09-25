@@ -22,11 +22,9 @@
  *    Own and read the Wayland selection directly, through
  *    ext-data-control-v1.
  *
- *    The alternative is to run wl-clipboard. wl-copy takes one --type and
- *    serves one payload, so the fallback has to pick one format and drops
- *    the rest, for example the RTF of a rich text copy. A data control
- *    source can offer several types and answer each request with the bytes
- *    for that type, as the X11 backend does with multiple selection targets.
+ *    A data control source can offer several types and answer each request
+ *    with the bytes for that type, as the X11 backend does with multiple
+ *    selection targets, and it needs no keyboard focus.
  */
 
 #ifndef _WAYLAND_CLIPBOARD_H_
@@ -52,8 +50,9 @@ typedef struct {
 /*
  * Connect and bind ext-data-control-v1.
  *
- * Returns FALSE when the compositor does not implement the protocol. GNOME is
- * the main case, since it does not implement data control protocols.
+ * Returns FALSE when the compositor does not implement the protocol, and the
+ * caller then falls back to the X selection. GNOME is the main case, since
+ * it does not implement data control protocols.
  */
 gboolean WaylandClipboard_Init(void);
 void WaylandClipboard_Exit(void);

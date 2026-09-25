@@ -46,7 +46,8 @@
 
 /*
  * The host accepts nothing larger than CPCLIPITEM_MAX_SIZE_V3 from
- * dndClipboard.h, so a larger selection is not worth buffering.
+ * dndClipboard.h, so a larger selection is not worth buffering. The X
+ * selection fallback in copyPasteUIWayland.cpp stops at the same limit.
  */
 #include "dndClipboard.h"
 
@@ -405,7 +406,8 @@ DevicePrimarySelection(void *data,                                // IN: unused
  * DeviceFinished --
  *
  *    The compositor has finished with the device, and any further request on
- *    it is a protocol error. Destroy it and mark the module unavailable.
+ *    it is a protocol error. Destroy it and mark the module unavailable, so
+ *    the callers fall back to the X selection.
  *
  *-----------------------------------------------------------------------------
  */
@@ -473,7 +475,8 @@ static const struct wl_registry_listener gRegistryListener = {
  *
  * Side effects:
  *    A dead display shuts the module down. IsAvailable() then returns FALSE,
- *    and the callers stop using a connection that will never answer.
+ *    and the callers use the X selection instead of a connection that will
+ *    never answer.
  *
  *-----------------------------------------------------------------------------
  */
@@ -514,7 +517,8 @@ DisplayReadable(gint fd,             // IN: unused
  *    watch the connection from the GLib main loop.
  *
  * Results:
- *    TRUE when the protocol is available, FALSE otherwise.
+ *    TRUE when the protocol is available. FALSE otherwise, and the caller
+ *    then falls back to the X selection.
  *
  *-----------------------------------------------------------------------------
  */

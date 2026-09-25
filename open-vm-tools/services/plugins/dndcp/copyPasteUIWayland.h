@@ -21,8 +21,11 @@
  *
  * This class implements host<->guest copy/paste (version 3+ of the protocol)
  * for Wayland sessions. The local selection is owned and read through
- * ext-data-control-v1 where the compositor implements it. This is the
- * counterpart of copyPasteUIX11.h for the Wayland platform.
+ * ext-data-control-v1 where the compositor implements it. Elsewhere, it is
+ * owned and read on the X CLIPBOARD selection through Xwayland, which the
+ * compositor keeps in step with the Wayland one, as GNOME does. GDK on its
+ * X11 backend owns it and reports its changes. This is the counterpart of
+ * copyPasteUIX11.h for the Wayland platform.
  *
  * Text, RTF and PNG images are supported.
  */
@@ -76,7 +79,24 @@ private:
    std::string mLastHostClip;
    bool mInited;
 
+   /*
+    * Changes to the selection as the X server sees them, where the
+    * compositor has no ext-data-control-v1. See WatchSelection().
+    */
+   static void OnSelectionChanged(CopyPasteUIWayland *self);
+   void WatchSelection(void);
    bool GetSelectionGeneration(guint64 *generation);
+   /*
+    * The clipboard that host clips go on, or NULL where they go through
+    * data control or there is no X display. Host clips use the X selection
+    * wherever reads can use it.
+    */
+   gpointer XWriterClipboard(void)
+   { return mXReaderOpen ? mWatchedClipboard : NULL; }
+   gpointer mWatchedClipboard;    /* GdkClipboard in GTK4, GtkClipboard in GTK3 */
+   gulong mWatchHandler;
+   bool mXReaderOpen;
+   guint64 mSelectionGeneration;
    /* The generation last read. See GetLocalClipboard(). */
    guint64 mReadGeneration;
    /* The generation last read again after its reads ran out of time. */

@@ -22,15 +22,25 @@
  * Wayland implementation of host<->guest copy/paste, derived from
  * copyPasteUIX11.cpp. Rather than owning an X selection through GtkClipboard,
  * the local selection is owned and read through ext-data-control-v1 in
- * waylandClipboard.c. A data control client needs no keyboard focus, unlike
- * the core wl_data_device protocol that GtkClipboard uses on Wayland. That is
- * what allows a background daemon to bridge the clipboard.
+ * waylandClipboard.c. Where the compositor does not implement it, the
+ * selection is owned and read on the X CLIPBOARD selection through Xwayland,
+ * which GNOME keeps in step with the Wayland one. A data control client and
+ * an X client need no keyboard focus, unlike the core wl_data_device
+ * protocol that GtkClipboard uses on Wayland. That is what allows a
+ * background daemon to bridge the clipboard.
  */
 
 #define G_LOG_DOMAIN "dndcp"
 
 #include <glib.h>
+#include <glib-unix.h>
+#include <errno.h>
+#include <signal.h>
 #include <string.h>
+#include <sys/poll.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <gtk/gtk.h>
 
 #include "vmware.h"
 #include "copyPasteUIWayland.h"
@@ -43,6 +53,9 @@ extern "C" {
 #include "str.h"
 #include "util.h"
 #include "dndCPMsgV4.h"
+
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
 }
 
 
@@ -53,6 +66,7 @@ extern "C" {
  * read have what is left of it.
  */
 #define CP_REQUEST_BUDGET_MS 2000
+
 
 /*
  *-----------------------------------------------------------------------------
@@ -80,6 +94,501 @@ CopyPasteWaylandRemainingMs(gint64 deadline)   // IN: monotonic, microseconds
 
 
 /*
+ * Reads through Xwayland where the compositor has no ext-data-control-v1.
+ * See CopyPasteXReaderOpen().
+ */
+static Display *gXReader = NULL;
+static Window gXReaderWindow = 0;
+/* Each CopyPasteUIWayland that opened the reader holds one reference. */
+static unsigned int gXReaderRefs = 0;
+
+/*
+ * Each read takes the next of these properties on the reader's window. An
+ * owner that answers a read after its deadline, or that still waits to send
+ * the next INCR chunk of an abandoned read, then writes to a property the
+ * current read does not look at.
+ */
+#define CP_XREADER_PROPS 16
+static unsigned int gXReaderSerial = 0;
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXReaderOpen --
+ *
+ *    Open an X connection to read the selection with, where the compositor
+ *    has no ext-data-control-v1.
+ *
+ *    GNOME has no data control protocol, and a core Wayland client reads the
+ *    selection only while it has the keyboard focus. Mutter keeps the X
+ *    CLIPBOARD selection in step with the Wayland one and answers any X
+ *    client for it, focused or not, so reading there needs no mapped window.
+ *    An unmapped InputOnly window receives the data.
+ *
+ * Results:
+ *    True if the connection is open.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteXReaderOpen(void)
+{
+   XSetWindowAttributes attrs;
+
+   if (gXReader != NULL) {
+      gXReaderRefs++;
+      return true;
+   }
+   if (getenv("DISPLAY") == NULL || (gXReader = XOpenDisplay(NULL)) == NULL) {
+      return false;
+   }
+   gXReaderRefs = 1;
+   attrs.event_mask = PropertyChangeMask;
+   gXReaderWindow = XCreateWindow(gXReader, DefaultRootWindow(gXReader),
+                                  -10, -10, 1, 1, 0, CopyFromParent,
+                                  InputOnly, CopyFromParent, CWEventMask,
+                                  &attrs);
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXReaderClose --
+ *
+ *    Drop one reference to the X connection, and close it with the last one.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+CopyPasteXReaderClose(void)
+{
+   if (gXReader != NULL && --gXReaderRefs == 0) {
+      XDestroyWindow(gXReader, gXReaderWindow);
+      XCloseDisplay(gXReader);
+      gXReader = NULL;
+      gXReaderWindow = 0;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXReaderUsable --
+ *
+ *    Whether a read can go through X. Not when the X selection has no owner,
+ *    which is also how it looks under a compositor that does not keep it in
+ *    step with the Wayland one. Copy and paste then has nothing to read.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteXReaderUsable(void)
+{
+   return gXReader != NULL &&
+          XGetSelectionOwner(gXReader,
+                             XInternAtom(gXReader, "CLIPBOARD", False)) != None;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXReaderWait --
+ *
+ *    Wait until the deadline for the next event of the given type on the
+ *    reader's window. For SelectionNotify, the event must answer a
+ *    conversion to target into prop, or refuse one to target. For
+ *    PropertyNotify, it must report a new value of prop. Other events are
+ *    dropped.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteXReaderWait(int type,          // IN
+                     Atom target,       // IN: SelectionNotify only
+                     Atom prop,         // IN
+                     gint64 deadline,   // IN: monotonic, microseconds
+                     XEvent *event)     // OUT
+{
+   for (;;) {
+      while (XPending(gXReader) > 0) {
+         XNextEvent(gXReader, event);
+         if (event->type == type && type == SelectionNotify &&
+             event->xselection.requestor == gXReaderWindow &&
+             event->xselection.target == target &&
+             (event->xselection.property == prop ||
+              event->xselection.property == None)) {
+            return true;
+         }
+         if (event->type == type && type == PropertyNotify &&
+             event->xproperty.window == gXReaderWindow &&
+             event->xproperty.atom == prop &&
+             event->xproperty.state == PropertyNewValue) {
+            return true;
+         }
+      }
+
+      unsigned int left = CopyPasteWaylandRemainingMs(deadline);
+      struct pollfd pfd;
+
+      if (left == 0) {
+         return false;
+      }
+      pfd.fd = ConnectionNumber(gXReader);
+      pfd.events = POLLIN;
+      pfd.revents = 0;
+      poll(&pfd, 1, (int) MIN(left, (unsigned int) G_MAXINT));
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXReaderGet --
+ *
+ *    Convert the selection to target and return the bytes, following INCR
+ *    for large ones. For a 32-bit format the items come back as longs, as
+ *    Xlib stores them. Stops at the V3 size ceiling, as the data control path
+ *    does.
+ *
+ * Results:
+ *    The data, to be freed with g_free(), or NULL if the owner refused,
+ *    did not answer before the deadline, or sent too much.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static guchar *
+CopyPasteXReaderGet(const char *target,  // IN
+                    gint64 deadline,     // IN: monotonic, microseconds
+                    gsize *outLen,       // OUT
+                    Atom *outType)       // OUT: may be NULL
+{
+   Display *d = gXReader;
+   Atom selection = XInternAtom(d, "CLIPBOARD", False);
+   Atom targetAtom = XInternAtom(d, target, False);
+   Atom incr = XInternAtom(d, "INCR", False);
+   char propName[32];
+   Atom prop;
+   GByteArray *acc;
+   XEvent event;
+   bool incremental = false;
+
+   *outLen = 0;
+
+   g_snprintf(propName, sizeof propName, "VMWARE_CP_READ_%u",
+              gXReaderSerial++ % CP_XREADER_PROPS);
+   prop = XInternAtom(d, propName, False);
+
+   /* Drop answers to earlier reads that ran out of time. */
+   XSync(d, False);
+   while (XPending(d) > 0) {
+      XNextEvent(d, &event);
+   }
+   XDeleteProperty(d, gXReaderWindow, prop);
+   XConvertSelection(d, selection, targetAtom, prop, gXReaderWindow,
+                     CurrentTime);
+   XFlush(d);
+   if (!CopyPasteXReaderWait(SelectionNotify, targetAtom, prop, deadline,
+                             &event) ||
+       event.xselection.property == None) {
+      return NULL;
+   }
+
+   acc = g_byte_array_new();
+   for (;;) {
+      Atom type = None;
+      int format = 0;
+      unsigned long items = 0;
+      unsigned long after = 0;
+      unsigned char *data = NULL;
+      gsize bytes;
+
+      if (XGetWindowProperty(d, gXReaderWindow, prop, 0, G_MAXLONG / 4, True,
+                             AnyPropertyType, &type, &format, &items, &after,
+                             &data) != Success) {
+         break;
+      }
+      if (type == incr) {
+         /* Deleting the property, done above, asks for the first chunk. */
+         XFree(data);
+         XFlush(d);
+         incremental = true;
+      } else {
+         bytes = (gsize) items * (format == 32 ? sizeof(long) :
+                                  (gsize) format / 8);
+         if (outType != NULL) {
+            *outType = type;
+         }
+         if (acc->len + bytes > (gsize) CPCLIPITEM_MAX_SIZE_V3) {
+            g_debug("%s: %s exceeds the V3 limit, dropping\n", __FUNCTION__,
+                    target);
+            XFree(data);
+            break;
+         }
+         g_byte_array_append(acc, data, (guint) bytes);
+         XFree(data);
+         XFlush(d);
+         if (!incremental || bytes == 0) {
+            *outLen = acc->len;
+            return (guchar *) g_byte_array_free(acc, FALSE);
+         }
+      }
+      if (!CopyPasteXReaderWait(PropertyNotify, None, prop, deadline,
+                                &event)) {
+         break;
+      }
+   }
+   g_byte_array_free(acc, TRUE);
+   return NULL;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXReaderHasType --
+ *
+ *    Whether the X selection offers mimeType. Mutter names its X targets
+ *    after the Wayland MIME types.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteXReaderHasType(const gchar *mimeType,  // IN
+                        gint64 deadline)        // IN: monotonic, microseconds
+{
+   gsize len = 0;
+   Atom type = None;
+   guchar *data = CopyPasteXReaderGet("TARGETS", deadline, &len, &type);
+   Atom wanted = XInternAtom(gXReader, mimeType, False);
+   bool found = false;
+
+   if (data != NULL && type == XA_ATOM) {
+      const long *atoms = (const long *) data;
+
+      for (gsize i = 0; i < len / sizeof(long); i++) {
+         if ((Atom) atoms[i] == wanted) {
+            found = true;
+            break;
+         }
+      }
+   }
+   g_free(data);
+   return found;
+}
+
+
+#ifndef GTK4
+/*
+ * What CopyPasteXWriterOffer() serves in GTK3. GtkClipboard passes the index
+ * of a target as its info.
+ */
+typedef struct {
+   std::vector<std::string> types;
+   std::vector<std::string> data;
+} CopyPasteXWriterContent;
+
+/* The content GtkClipboard serves for this process, NULL once it lost it. */
+static CopyPasteXWriterContent *gXWriterContent = NULL;
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXWriterGet --
+ *
+ *    GtkClipboardGetFunc. Answer a request for the target at index info.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+CopyPasteXWriterGet(GtkClipboard *clipboard,      // IN: unused
+                    GtkSelectionData *selection,  // OUT
+                    guint info,                   // IN
+                    gpointer userData)            // IN
+{
+   CopyPasteXWriterContent *content = (CopyPasteXWriterContent *) userData;
+
+   if (info < content->data.size()) {
+      gtk_selection_data_set(selection,
+                             gtk_selection_data_get_target(selection), 8,
+                             (const guchar *) content->data[info].data(),
+                             (gint) content->data[info].size());
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXWriterFree --
+ *
+ *    GtkClipboardClearFunc. GtkClipboard no longer serves the content,
+ *    because it was replaced or cleared, or another client took the
+ *    selection.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+CopyPasteXWriterFree(GtkClipboard *clipboard,  // IN: unused
+                     gpointer userData)        // IN
+{
+   CopyPasteXWriterContent *content = (CopyPasteXWriterContent *) userData;
+
+   if (gXWriterContent == content) {
+      gXWriterContent = NULL;
+   }
+   delete content;
+}
+#endif
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXWriterOffer --
+ *
+ *    Own the X CLIPBOARD selection through GDK and offer every item on it,
+ *    where the compositor has no ext-data-control-v1.
+ *
+ *    On GNOME a Wayland client sets the selection only from a window with the
+ *    keyboard focus, which shows in the dock, takes the focus and can take a
+ *    Ctrl+V meant for the application. Mutter makes the X selection the
+ *    Wayland selection, with every type the X owner offers, and asks the
+ *    owner for the data when a Wayland client pastes. An X client needs no
+ *    focus to own the selection.
+ *
+ *    GDK copies the data and serves it from the main loop until the
+ *    selection is replaced, cleared or taken by another client. GDK on X11
+ *    offers UTF8_STRING, STRING, TEXT and COMPOUND_TEXT for
+ *    text/plain;charset=utf-8 by itself, so the GTK4 path leaves the
+ *    UTF8_STRING item out. GTK3 serves only the targets it is given.
+ *
+ * Results:
+ *    true if this process owns the selection with the items on it.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteXWriterOffer(gpointer clipboard,           // IN: from WatchSelection()
+                      const WaylandClipItem *items, // IN
+                      size_t count)                 // IN
+{
+#ifdef GTK4
+   GdkContentProvider **providers = g_new(GdkContentProvider *, count);
+   GdkContentProvider *content;
+   size_t n = 0;
+   bool ok;
+
+   for (size_t i = 0; i < count; i++) {
+      GBytes *bytes;
+
+      if (strcmp(items[i].mimeType, "UTF8_STRING") == 0) {
+         continue;
+      }
+      bytes = g_bytes_new(items[i].data, items[i].size);
+      providers[n++] = gdk_content_provider_new_for_bytes(items[i].mimeType,
+                                                          bytes);
+      g_bytes_unref(bytes);
+   }
+   /* The union takes the providers and copies the array. */
+   content = gdk_content_provider_new_union(providers, n);
+   g_free(providers);
+   ok = gdk_clipboard_set_content(GDK_CLIPBOARD(clipboard), content);
+   g_object_unref(content);
+   return ok;
+#else
+   CopyPasteXWriterContent *content = new CopyPasteXWriterContent;
+   std::vector<GtkTargetEntry> targets(count);
+
+   for (size_t i = 0; i < count; i++) {
+      content->types.push_back(items[i].mimeType);
+      content->data.push_back(std::string((const char *) items[i].data,
+                                          items[i].size));
+   }
+   for (size_t i = 0; i < count; i++) {
+      targets[i].target = (gchar *) content->types[i].c_str();
+      targets[i].flags = 0;
+      targets[i].info = (guint) i;
+   }
+   /* This frees the content it replaces through CopyPasteXWriterFree(). */
+   if (!gtk_clipboard_set_with_data(GTK_CLIPBOARD(clipboard), &targets[0],
+                                    (guint) count, CopyPasteXWriterGet,
+                                    CopyPasteXWriterFree, content)) {
+      delete content;
+      return false;
+   }
+   gXWriterContent = content;
+   return true;
+#endif
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXWriterIsOwner --
+ *
+ *    Whether the X selection holds what CopyPasteXWriterOffer() put on it.
+ *    This turns false when another client takes the selection.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteXWriterIsOwner(gpointer clipboard)  // IN/OPT: from WatchSelection()
+{
+   if (clipboard == NULL) {
+      return false;
+   }
+#ifdef GTK4
+   return gdk_clipboard_is_local(GDK_CLIPBOARD(clipboard));
+#else
+   return gXWriterContent != NULL;
+#endif
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteXWriterClear --
+ *
+ *    Give up the selection if CopyPasteXWriterOffer() still owns it, and
+ *    free what it served.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+CopyPasteXWriterClear(gpointer clipboard)  // IN/OPT: from WatchSelection()
+{
+   if (!CopyPasteXWriterIsOwner(clipboard)) {
+      return;
+   }
+#ifdef GTK4
+   gdk_clipboard_set_content(GDK_CLIPBOARD(clipboard), NULL);
+#else
+   gtk_clipboard_clear(GTK_CLIPBOARD(clipboard));
+#endif
+}
+
+
+/*
  *-----------------------------------------------------------------------------
  *
  * CopyPasteWaylandHasType --
@@ -96,6 +605,10 @@ CopyPasteWaylandHasType(const gchar *mimeType,  // IN
 {
    if (WaylandClipboard_IsAvailable()) {
       return WaylandClipboard_HasType(mimeType);
+   }
+
+   if (CopyPasteXReaderUsable()) {
+      return CopyPasteXReaderHasType(mimeType, deadline);
    }
    return false;
 }
@@ -127,6 +640,20 @@ CopyPasteWaylandGetData(const gchar *mimeType,  // IN
          *outLen = (gsize) n;
       }
       return (guchar *) d;
+   }
+
+   if (CopyPasteXReaderUsable()) {
+      gsize n = 0;
+      guchar *d = CopyPasteXReaderGet(mimeType, deadline, &n, NULL);
+
+      if (d != NULL && n == 0) {
+         g_free(d);
+         d = NULL;
+      }
+      if (outLen != NULL) {
+         *outLen = d != NULL ? n : 0;
+      }
+      return d;
    }
 
    if (outLen != NULL) {
@@ -193,6 +720,10 @@ CopyPasteWaylandGetText(gsize *outLen,   // OUT
 CopyPasteUIWayland::CopyPasteUIWayland()
  : mCP(NULL),
    mInited(false),
+   mWatchedClipboard(NULL),
+   mWatchHandler(0),
+   mXReaderOpen(false),
+   mSelectionGeneration(0),
    mReadGeneration(G_MAXUINT64),
    mRetriedGeneration(G_MAXUINT64)
 {
@@ -216,6 +747,16 @@ CopyPasteUIWayland::CopyPasteUIWayland()
 
 CopyPasteUIWayland::~CopyPasteUIWayland()
 {
+   if (mWatchedClipboard != NULL) {
+      g_signal_handler_disconnect(mWatchedClipboard, mWatchHandler);
+      CopyPasteXWriterClear(XWriterClipboard());
+      g_object_unref(mWatchedClipboard);
+      mWatchedClipboard = NULL;
+   }
+   if (mXReaderOpen) {
+      CopyPasteXReaderClose();
+      mXReaderOpen = false;
+   }
    WaylandClipboard_Exit();
    CPClipboard_Destroy(&mClipboard);
 }
@@ -242,13 +783,17 @@ CopyPasteUIWayland::Init()
 
    /*
     * Own the selection directly when the compositor implements
-    * ext-data-control-v1. This has to happen before the baseline read below.
+    * ext-data-control-v1. Otherwise, which is the case on GNOME, fall back to
+    * the X selection, see WatchSelection().
+    *
+    * This has to happen before the baseline read below, or that read goes
+    * through X even when the native path is the one in use.
     */
    if (WaylandClipboard_Init()) {
       g_debug("%s: using the native Wayland selection\n", __FUNCTION__);
    } else {
-      g_warning("%s: the compositor does not offer ext-data-control-v1, "
-                "copy and paste is disabled\n", __FUNCTION__);
+      g_debug("%s: ext-data-control-v1 unavailable, using the X selection\n",
+              __FUNCTION__);
    }
 
    /*
@@ -256,12 +801,19 @@ CopyPasteUIWayland::Init()
     * pre-existing clipboard looks new and overwrites a newer host clipboard as
     * soon as the VM receives focus.
     */
+   WatchSelection();
    GetSelectionGeneration(&mReadGeneration);
    gsize len = 0;
    gchar *text = CopyPasteWaylandGetText(&len,
       g_get_monotonic_time() + CP_REQUEST_BUDGET_MS * 1000);
    mLastClipboardText.assign(text != NULL ? text : "", len);
    g_free(text);
+
+   if (!WaylandClipboard_IsAvailable() && XWriterClipboard() == NULL) {
+      g_warning("%s: the compositor does not offer ext-data-control-v1 and "
+                "there is no X display. Copy and paste is disabled.\n",
+                __FUNCTION__);
+   }
 
    mCP->srcRecvClipChanged.connect(
       sigc::mem_fun(this, &CopyPasteUIWayland::GetRemoteClipboardCB));
@@ -352,7 +904,8 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
       }
       DynBuf_Destroy(&serialized);
       if (!current.empty() && current == mLastHostClip &&
-          WaylandClipboard_IsOwner()) {
+          (WaylandClipboard_IsOwner() ||
+           CopyPasteXWriterIsOwner(XWriterClipboard()))) {
          g_debug("%s: the guest still offers this host clip; leaving it\n",
                  __FUNCTION__);
          return;
@@ -431,9 +984,12 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
    g_debug("%s: offering %d formats locally\n", __FUNCTION__,
            (int) items.size());
 
-   bool ok = false;
+   bool ok;
    if (WaylandClipboard_IsAvailable()) {
       ok = WaylandClipboard_Offer(&items[0], items.size());
+   } else {
+      ok = XWriterClipboard() != NULL &&
+           CopyPasteXWriterOffer(XWriterClipboard(), &items[0], items.size());
    }
 
    if (!ok) {
@@ -461,14 +1017,82 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
 /*
  *-----------------------------------------------------------------------------
  *
+ * CopyPasteUIWayland::WatchSelection --
+ *
+ *    On the fallback, count changes to the selection, so that
+ *    GetLocalClipboard() reads it only after one, and open the X reader.
+ *    Host clips go on the watched clipboard once the X reader is open. See
+ *    XWriterClipboard().
+ *
+ *    The host asks for the guest clipboard every few seconds while the
+ *    pointer moves in and out of the VM. Mutter keeps the X CLIPBOARD
+ *    selection in step with the Wayland one and sets its owner again on
+ *    every change. GDK on X11 reports that as "changed" in GTK4 and as
+ *    "owner-change" in GTK3, without reading anything. GDK runs on X11 here,
+ *    since drag and drop needs it. The native backend is left out, because
+ *    waylandClipboard.c counts the changes itself.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::WatchSelection(void)
+{
+   GdkDisplay *display = gdk_display_get_default();
+
+   if (WaylandClipboard_IsAvailable() || display == NULL) {
+      return;
+   }
+#ifdef GTK4
+   mWatchedClipboard = g_object_ref(gdk_display_get_clipboard(display));
+   mWatchHandler = g_signal_connect_swapped(mWatchedClipboard, "changed",
+                                            G_CALLBACK(OnSelectionChanged),
+                                            this);
+#else
+   mWatchedClipboard = g_object_ref(
+      gtk_clipboard_get_for_display(display, GDK_SELECTION_CLIPBOARD));
+   mWatchHandler = g_signal_connect_swapped(mWatchedClipboard, "owner-change",
+                                            G_CALLBACK(OnSelectionChanged),
+                                            this);
+#endif
+   mXReaderOpen = CopyPasteXReaderOpen();
+   g_debug("%s: reading the selection only after it changes, %s\n",
+           __FUNCTION__,
+           mXReaderOpen ? "through X" : "but there is no X display");
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::OnSelectionChanged --
+ *
+ *    The watched clipboard reports a change. The signal is connected
+ *    swapped, so the object comes first, and the GTK4 and GTK3 signals can
+ *    share this handler although their other arguments differ.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::OnSelectionChanged(CopyPasteUIWayland *self)  // IN
+{
+   self->mSelectionGeneration++;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * CopyPasteUIWayland::GetSelectionGeneration --
  *
  *    Get a number that changes whenever the local selection changes. The
- *    native backend counts selection events.
+ *    native backend counts selection events. The fallback counts the
+ *    notifications WatchSelection() set up.
  *
  * Results:
- *    false when nothing counts the changes, which is where the compositor has
- *    no ext-data-control-v1. Every request then reads the selection.
+ *    false when nothing counts the changes, which is the fallback without an
+ *    X display. Every request then reads the selection.
  *
  *-----------------------------------------------------------------------------
  */
@@ -478,6 +1102,10 @@ CopyPasteUIWayland::GetSelectionGeneration(guint64 *generation)  // OUT
 {
    if (WaylandClipboard_IsAvailable()) {
       *generation = WaylandClipboard_GetSelectionSerial();
+      return true;
+   }
+   if (mWatchedClipboard != NULL) {
+      *generation = mSelectionGeneration;
       return true;
    }
    return false;
@@ -525,9 +1153,13 @@ CopyPasteUIWayland::GetLocalClipboard(void)
    /*
     * When this client owns the selection, the selection holds what the host
     * sent, so there is nothing new to report. Reading it back would send the
-    * host its own data.
+    * host its own data. On the
+    * fallback this process owns the X selection after
+    * CopyPasteXWriterOffer(). GDK answers a read of it from this main loop,
+    * which the read holds, so the read would also wait out the budget.
     */
-   if (WaylandClipboard_IsOwner()) {
+   if (WaylandClipboard_IsOwner() ||
+       CopyPasteXWriterIsOwner(XWriterClipboard())) {
       g_debug("%s: we own the local selection, nothing new for the host\n",
               __FUNCTION__);
       SendClipNotChanged();

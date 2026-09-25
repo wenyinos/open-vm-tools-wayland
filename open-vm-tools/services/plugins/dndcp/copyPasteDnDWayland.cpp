@@ -114,7 +114,9 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
     * backend. Under a Wayland session that makes the detection window an
     * Xwayland client. DnDUIX11 then uses XDND, which the compositor bridges
     * to native clients. The X11-specific code would crash on a Wayland
-    * GdkSurface. This mirrors CopyPasteDnDX11::Init.
+    * GdkSurface. This mirrors CopyPasteDnDX11::Init. Where the compositor has
+    * no ext-data-control-v1, copy and paste owns the X selection through GDK
+    * and learns from GDK when the selection changes.
     */
    gdk_set_allowed_backends("x11");
 #ifdef GTK4
