@@ -181,6 +181,20 @@ private:
    } WaylandDragTicket;
 
    /*
+    * Native Wayland drop target for guest to host drags, where the
+    * compositor supports the native drag source.
+    */
+   bool LocalShowNativeDropTarget(int32 x, int32 y);
+   void LocalHideNativeDropTarget(bool keepHeldDrag);
+   void LocalNudgeNativeDropTarget(int32 x, int32 y);
+   static gboolean OnNativeDropShown(gpointer ctx);
+   static gboolean OnNativeDropNudge(gpointer ctx);
+   static void OnNativeDropData(const char *mimeType, const char *data,
+                                size_t size, void *ctx);
+   static void OnNativeDrop(void *ctx);
+   static void OnNativeDropLeave(void *ctx);
+
+   /*
     * Gtk+ Callbacks: Drag Source
     */
    static void OnGtkSrcDragBegin(const Glib::RefPtr< Gdk::Drag > &drag, void *ctx);
@@ -200,6 +214,7 @@ private:
     * Target function for GH DnD. Makes call to common layer.
     */
    void TargetDragEnter();
+   void LocalBeginGHDrag(void);
 
    /*
     * Misc methods.
@@ -284,6 +299,32 @@ private:
    bool mWaylandDragActive;
    /* Which native drag is current; a done() for any other is ignored. */
    unsigned int mWaylandDragGen;
+   /*
+    * The native drop target stands in for the detection window in the
+    * current guest to host drag. See LocalShowNativeDropTarget().
+    */
+   bool mGHNative;
+   /*
+    * The host has hidden the detection window, but the guest's drag still
+    * holds the native drop target, which stays until the drag ends.
+    */
+   bool mGHNativeLinger;
+   /*
+    * The host was told about the drag the native drop target holds. Only
+    * such a drag keeps the drop target; any other is let through.
+    */
+   bool mGHNativeHostTold;
+   /* The drag the drop target already held is to be handed over again. */
+   bool mGHNativeResend;
+   guint mGHNativeNudgeTimer;
+   int mGHNativeNudgesLeft;
+   /* Where ShowDetWnd() was asked to show the drop target. */
+   int32 mGHNativeExitX;
+   int32 mGHNativeExitY;
+   /* The native drop target was never reached; use the X window instead. */
+   bool mGHNativeFallback;
+   int32 mGHNativeX;
+   int32 mGHNativeY;
    /* The staging directory holds placeholders, and the drop adds the block. */
    bool mHGDeferBlock;
    DND_DROPEFFECT mEffect;

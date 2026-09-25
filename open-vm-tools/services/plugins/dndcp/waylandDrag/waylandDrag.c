@@ -19,7 +19,8 @@
 /*
  * waylandDrag.c --
  *
- *    Start a host to guest drag natively, through wl_data_device.
+ *    Start a host to guest drag natively, through wl_data_device, and take
+ *    a guest to host drag the same way.
  *
  *    Like the clipboard backend this keeps its own connection to the
  *    compositor, because GDK is pinned to its x11 backend for the detection
@@ -38,6 +39,7 @@
 #include <wayland-client.h>
 #include <glib-unix.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/poll.h>
 #include <string.h>
 #include <stdint.h>
@@ -45,6 +47,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * The host accepts nothing larger than CPCLIPITEM_MAX_SIZE_V3 from
+ * dndClipboard.h, so the drop target reads no more than that.
+ */
+#include "dndClipboard.h"
 
 /*
  * There is one overlay per output. A Wayland client is not told where the
@@ -105,6 +113,24 @@
  * before moving the pointer again so it decides on it.
  */
 #define WAYLAND_DRAG_REFOCUS_SETTLE_MS 150
+
+/*
+ * How long the drop target waits for a drag's contents. A source answers in
+ * milliseconds. The read runs from the main loop and never blocks it, so
+ * this only bounds how long a source that never answers holds the read.
+ */
+#define WAYLAND_DROP_READ_TIMEOUT_MS 2000
+
+/*
+ * The types the drop target reads, best first. The bits of offerTypes
+ * follow this order.
+ */
+static const char *const gDropTypes[] = {
+   "text/uri-list",
+   "text/plain;charset=utf-8",
+   "UTF8_STRING",
+   "text/plain",
+};
 
 
 typedef struct {
@@ -195,6 +221,48 @@ static struct {
    /* Fires if the target never finishes a drop it was given. */
    guint finishTimer;
    gboolean inited;
+
+   /*
+    * Which of gDropTypes the latest offer lists, one bit each, and the
+    * action the compositor chose for the offer the drop target holds.
+    */
+   unsigned int offerTypes;
+   uint32_t dtAction;
+
+   /* The drop target. See WaylandDrag_ShowDropTarget(). */
+   gboolean dtShown;
+   /* The overlays take the pointer. */
+   gboolean dtInput;
+   WaylandDropDataFunc dtOnData;
+   WaylandDropEventFunc dtOnDrop;
+   WaylandDropEventFunc dtOnLeave;
+   void *dtClientData;
+   /*
+    * The offer of the drag over the drop target. It stays after the drop
+    * until the drop is finished.
+    */
+   struct wl_data_offer *dtOffer;
+   uint32_t dtSerial;
+   /* The type read, one of gDropTypes, or NULL if the drag has none. */
+   const char *dtMime;
+   /* The compositor sent wl_data_device.drop for dtOffer. */
+   gboolean dtDropped;
+   /* A drag or the pointer has entered the drop target since it was shown. */
+   gboolean dtReached;
+   /* The contents of dtOffer have been read in full, and are in dtData. */
+   gboolean dtHaveData;
+   GByteArray *dtData;
+   /*
+    * dtOffer lists no type the host takes, or its contents could not be
+    * read. The host never hears of such a drag, so the drop target lets it
+    * through to the windows under it.
+    */
+   gboolean dtUnusable;
+   /* The read of dtOffer's contents. dtFd is -1 when there is none. */
+   int dtFd;
+   guint dtWatch;
+   guint dtTimer;
+   GByteArray *dtAcc;
 } gDrag;
 
 /*
@@ -206,6 +274,7 @@ static gboolean gUnsupported;
 
 
 static void Finish(void);
+static void DropFinish(void);
 
 
 /*
@@ -688,10 +757,495 @@ OfferDestroy(struct wl_data_offer *offer)   // IN/OPT
 /*
  *-----------------------------------------------------------------------------
  *
+ * OfferOffer, OfferSourceActions, OfferAction --
+ *
+ *    Note which of gDropTypes the latest offer lists, and the action the
+ *    compositor chose for the offer the drop target holds.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+OfferOffer(void *data,                // IN: unused
+           struct wl_data_offer *o,   // IN
+           const char *mimeType)      // IN
+{
+   size_t i;
+
+   if (o != gDrag.offer) {
+      return;
+   }
+   for (i = 0; i < G_N_ELEMENTS(gDropTypes); i++) {
+      if (strcmp(mimeType, gDropTypes[i]) == 0) {
+         gDrag.offerTypes |= 1u << i;
+      }
+   }
+}
+
+static void
+OfferSourceActions(void *data,                // IN: unused
+                   struct wl_data_offer *o,   // IN: unused
+                   uint32_t actions)          // IN: unused
+{
+}
+
+static void
+OfferAction(void *data,                // IN: unused
+            struct wl_data_offer *o,   // IN
+            uint32_t action)           // IN
+{
+   if (o == gDrag.dtOffer) {
+      gDrag.dtAction = action;
+   }
+}
+
+static const struct wl_data_offer_listener gOfferListener = {
+   .offer = OfferOffer,
+   .source_actions = OfferSourceActions,
+   .action = OfferAction,
+};
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropStopRead --
+ *
+ *    Stop reading the drop target's offer, and close the pipe. The bytes
+ *    read so far stay in dtAcc.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropStopRead(void)
+{
+   if (gDrag.dtWatch != 0) {
+      g_source_remove(gDrag.dtWatch);
+      gDrag.dtWatch = 0;
+   }
+   if (gDrag.dtTimer != 0) {
+      g_source_remove(gDrag.dtTimer);
+      gDrag.dtTimer = 0;
+   }
+   if (gDrag.dtFd >= 0) {
+      close(gDrag.dtFd);
+      gDrag.dtFd = -1;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropForgetOffer --
+ *
+ *    Stop any read and destroy the offer the drop target holds, without
+ *    finishing it.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropForgetOffer(void)
+{
+   DropStopRead();
+   if (gDrag.dtAcc != NULL) {
+      g_byte_array_free(gDrag.dtAcc, TRUE);
+      gDrag.dtAcc = NULL;
+   }
+   if (gDrag.dtData != NULL) {
+      g_byte_array_free(gDrag.dtData, TRUE);
+      gDrag.dtData = NULL;
+   }
+   OfferDestroy(gDrag.dtOffer);
+   gDrag.dtOffer = NULL;
+   gDrag.dtMime = NULL;
+   gDrag.dtHaveData = FALSE;
+   gDrag.dtUnusable = FALSE;
+   gDrag.dtAction = 0;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropUnusable --
+ *
+ *    The drag over the drop target is of no use to the host. Take the
+ *    overlays out of hit testing, so that the next motion hands the drag to
+ *    the window under the pointer, as it would without the drop target. The
+ *    offer stays until the compositor sends leave.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropUnusable(const char *why)   // IN: for the log
+{
+   g_debug("%s: %s; letting the drag through\n", __FUNCTION__, why);
+   gDrag.dtUnusable = TRUE;
+   if (!gDrag.dtDropped) {
+      WaylandDrag_DropTargetSetInput(FALSE);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropDeliver --
+ *
+ *    Hand the contents of the drop target's offer to the caller. The caller
+ *    gets its own NUL-terminated copy, because the callback may hide the drop
+ *    target, which frees dtData.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropDeliver(void)
+{
+   const char *mime = gDrag.dtMime;
+   gsize len;
+   char *copy;
+
+   if (!gDrag.dtHaveData || gDrag.dtData == NULL || gDrag.dtOnData == NULL) {
+      return;
+   }
+   len = gDrag.dtData->len;
+   copy = g_malloc(len + 1);
+   memcpy(copy, gDrag.dtData->data, len);
+   copy[len] = '\0';
+   gDrag.dtOnData(mime, copy, len, gDrag.dtClientData);
+   g_free(copy);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropReadDone --
+ *
+ *    The read of the drop target's offer has ended. Hand the bytes to the
+ *    caller if the read was complete, and finish a drop that was waiting for
+ *    them.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropReadDone(gboolean complete)   // IN: the source closed the pipe
+{
+   GByteArray *acc = gDrag.dtAcc;
+   const char *mime = gDrag.dtMime;
+
+   gDrag.dtAcc = NULL;
+   DropStopRead();
+
+   if (complete && acc != NULL && acc->len > 0) {
+      gDrag.dtHaveData = TRUE;
+      gDrag.dtData = acc;
+      g_debug("%s: read %u bytes of %s from the drag\n", __FUNCTION__,
+              acc->len, mime);
+   } else {
+      if (acc != NULL) {
+         g_byte_array_free(acc, TRUE);
+      }
+      DropUnusable("the drag gave nothing to read");
+   }
+
+   /*
+    * A drop that came before the contents is finished now. The drag is over
+    * then, and the host must not be told of it any more.
+    */
+   if (gDrag.dtDropped) {
+      DropFinish();
+      return;
+   }
+
+   /* The callback comes last. It may hide the drop target. */
+   DropDeliver();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropReadable, DropReadTimedOut --
+ *
+ *    Read what the source has written to the pipe, without waiting, until it
+ *    closes the pipe, the contents pass CPCLIPITEM_MAX_SIZE_V3, or
+ *    WAYLAND_DROP_READ_TIMEOUT_MS passes.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static gboolean
+DropReadable(gint fd,             // IN
+             GIOCondition cond,   // IN: unused
+             gpointer data)       // IN: unused
+{
+   for (;;) {
+      char buf[16 * 1024];
+      ssize_t n = read(fd, buf, sizeof buf);
+
+      if (n > 0) {
+         if ((gsize) gDrag.dtAcc->len + (gsize) n >
+             (gsize) CPCLIPITEM_MAX_SIZE_V3) {
+            g_warning("%s: the drag carries more %s than the host takes\n",
+                      __FUNCTION__, gDrag.dtMime);
+            gDrag.dtWatch = 0;
+            DropReadDone(FALSE);
+            return G_SOURCE_REMOVE;
+         }
+         g_byte_array_append(gDrag.dtAcc, (const guint8 *) buf, (guint) n);
+         continue;
+      }
+      if (n < 0 && errno == EINTR) {
+         continue;
+      }
+      if (n < 0 && errno == EAGAIN) {
+         return G_SOURCE_CONTINUE;
+      }
+      if (n < 0) {
+         g_debug("%s: read: %s\n", __FUNCTION__, g_strerror(errno));
+      }
+      /* Returning G_SOURCE_REMOVE removes the watch. */
+      gDrag.dtWatch = 0;
+      DropReadDone(n == 0);
+      return G_SOURCE_REMOVE;
+   }
+}
+
+
+static gboolean
+DropReadTimedOut(gpointer data)   // IN: unused
+{
+   gDrag.dtTimer = 0;
+   g_warning("%s: the drag's source sent no %s in %ums\n", __FUNCTION__,
+             gDrag.dtMime, (unsigned) WAYLAND_DROP_READ_TIMEOUT_MS);
+   DropReadDone(FALSE);
+
+   return G_SOURCE_REMOVE;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropStartRead --
+ *
+ *    Ask the source for the drop target's offer in dtMime, and read the
+ *    answer from the main loop.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropStartRead(void)
+{
+   int fds[2];
+
+   /*
+    * pipe2() rather than g_unix_open_pipe(), which accepts O_CLOEXEC only
+    * from GLib 2.78 on.
+    */
+   if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
+      g_warning("%s: pipe2: %s\n", __FUNCTION__, g_strerror(errno));
+      DropUnusable("no pipe to read the drag through");
+      return;
+   }
+   wl_data_offer_receive(gDrag.dtOffer, gDrag.dtMime, fds[1]);
+   wl_display_flush(gDrag.display);
+   close(fds[1]);
+
+   gDrag.dtFd = fds[0];
+   gDrag.dtAcc = g_byte_array_new();
+   gDrag.dtWatch = g_unix_fd_add(fds[0], G_IO_IN | G_IO_HUP | G_IO_ERR,
+                                 DropReadable, NULL);
+   gDrag.dtTimer = g_timeout_add(WAYLAND_DROP_READ_TIMEOUT_MS,
+                                 DropReadTimedOut, NULL);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropFinish --
+ *
+ *    End a drop on the drop target. Once the contents are in, and the
+ *    compositor has chosen copy, wl_data_offer.finish tells the
+ *    source the drop succeeded. The protocol forbids finish before version
+ *    3, and for an offer with no accepted type or no action. Destroying the
+ *    offer without finish makes the compositor cancel the drag instead.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropFinish(void)
+{
+   struct wl_data_offer *o = gDrag.dtOffer;
+   gboolean v3;
+
+   if (o == NULL) {
+      return;
+   }
+   v3 = wl_data_offer_get_version(o) >= WL_DATA_OFFER_FINISH_SINCE_VERSION;
+   if (gDrag.dtHaveData && gDrag.dtMime != NULL &&
+       (!v3 || gDrag.dtAction == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)) {
+      if (v3) {
+         wl_data_offer_finish(o);
+      }
+      g_debug("%s: finished the drop of %s (action %u)\n", __FUNCTION__,
+              gDrag.dtMime, gDrag.dtAction);
+   } else {
+      g_debug("%s: not finishing a drop with no contents or no action "
+              "(action %u)\n", __FUNCTION__, gDrag.dtAction);
+   }
+   gDrag.dtOffer = NULL;
+   wl_data_offer_destroy(o);
+   wl_display_flush(gDrag.display);
+   /* A read still in progress has nothing left to deliver to. */
+   if (gDrag.dtAcc != NULL) {
+      DropStopRead();
+      g_byte_array_free(gDrag.dtAcc, TRUE);
+      gDrag.dtAcc = NULL;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DropTargetEnter, DropTargetMotion, DropTargetLeave, DropTargetDrop --
+ *
+ *    The drag as the drop target sees it.
+ *
+ *    On enter, pick the best type the offer lists, accept it for copy only,
+ *    so that a source never deletes what the host has yet to read. Then read
+ *    the contents straight away. The host has to be told what the drag
+ *    carries before the user lets go over the host. A drag with no type the
+ *    host takes is let through, see DropUnusable().
+ *
+ *    The accept is repeated on every motion, so that the source's latest
+ *    wl_data_source.target names the type wherever the drag is on the
+ *    overlay.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DropTargetEnter(uint32_t serial,           // IN
+                struct wl_data_offer *o)   // IN/OPT
+{
+   unsigned int types = o != NULL && o == gDrag.offer ? gDrag.offerTypes : 0;
+   size_t i;
+
+   /* A drag that never left, or a drop that never finished. */
+   DropForgetOffer();
+   gDrag.dtDropped = FALSE;
+   gDrag.dtReached = TRUE;
+
+   if (o == NULL) {
+      g_debug("%s: a drag with nothing on offer entered the drop target\n",
+              __FUNCTION__);
+      return;
+   }
+   /* The drop target owns the offer now, so a new offer must not free it. */
+   if (o == gDrag.offer) {
+      gDrag.offer = NULL;
+   }
+   gDrag.dtOffer = o;
+   gDrag.dtSerial = serial;
+
+   for (i = 0; i < G_N_ELEMENTS(gDropTypes); i++) {
+      if ((types & (1u << i)) != 0) {
+         gDrag.dtMime = gDropTypes[i];
+         break;
+      }
+   }
+   if (gDrag.dtMime == NULL) {
+      wl_data_offer_accept(o, serial, NULL);
+      DropUnusable("the drag offers nothing the host takes");
+      wl_display_flush(gDrag.display);
+      return;
+   }
+
+   wl_data_offer_accept(o, serial, gDrag.dtMime);
+   /*
+    * Copy only. The host reads the files after the drop, and a source that
+    * sees a move finish may delete them first. A source that offers only a
+    * move gets no action, and the drop is refused.
+    */
+   if (wl_data_offer_get_version(o) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION) {
+      wl_data_offer_set_actions(o, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+   }
+   g_debug("%s: a drag entered the drop target, reading %s\n", __FUNCTION__,
+           gDrag.dtMime);
+   DropStartRead();
+}
+
+static void
+DropTargetMotion(void)
+{
+   if (gDrag.dtOffer != NULL && !gDrag.dtDropped) {
+      wl_data_offer_accept(gDrag.dtOffer, gDrag.dtSerial, gDrag.dtMime);
+   }
+}
+
+static void
+DropTargetLeave(void)
+{
+   if (gDrag.dtOffer == NULL) {
+      return;
+   }
+   if (gDrag.dtDropped) {
+      /* Keep the offer. DropFinish() still needs it. */
+      return;
+   }
+   g_debug("%s: the drag left the drop target\n", __FUNCTION__);
+   DropForgetOffer();
+
+   /* The callback comes last. It may hide the drop target. */
+   if (gDrag.dtOnLeave != NULL) {
+      gDrag.dtOnLeave(gDrag.dtClientData);
+   }
+}
+
+static void
+DropTargetDrop(void)
+{
+   if (gDrag.dtOffer == NULL) {
+      g_debug("%s: a drop with no drag over the drop target\n", __FUNCTION__);
+      return;
+   }
+   gDrag.dtDropped = TRUE;
+   g_debug("%s: the drag dropped on the drop target\n", __FUNCTION__);
+   /* Otherwise DropReadDone() finishes the drop when the read ends. */
+   if (gDrag.dtFd < 0) {
+      DropFinish();
+   }
+
+   /* The callback comes last. It may hide the drop target. */
+   if (gDrag.dtOnDrop != NULL) {
+      gDrag.dtOnDrop(gDrag.dtClientData);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * DeviceDataOffer, DeviceEnter, DeviceLeave, DeviceMotion, DeviceDrop,
  * DeviceSelection --
  *
  *    The drag as this client's own data device sees it.
+ *
+ *    While the drop target is shown, these events go to the DropTarget
+ *    functions above. Otherwise they belong to this module's own drag.
  *
  *    The compositor must stop offering the drag to the overlay as soon as
  *    HideOverlays() runs. These data device events are the only way to see
@@ -716,17 +1270,23 @@ DeviceDataOffer(void *d,                    // IN: unused
     */
    OfferDestroy(gDrag.offer);
    gDrag.offer = o;
+   gDrag.offerTypes = 0;
+   wl_data_offer_add_listener(o, &gOfferListener, NULL);
 }
 
 static void
 DeviceEnter(void *d,                     // IN: unused
             struct wl_data_device *dd,   // IN: unused
-            uint32_t serial,             // IN: unused
+            uint32_t serial,             // IN
             struct wl_surface *surface,  // IN: unused
             wl_fixed_t x,                // IN: unused
             wl_fixed_t y,                // IN: unused
-            struct wl_data_offer *o)     // IN: unused
+            struct wl_data_offer *o)     // IN/OPT
 {
+   if (gDrag.dtShown) {
+      DropTargetEnter(serial, o);
+      return;
+   }
    DragIsReal();
    gDrag.overlayEntered = TRUE;
    g_debug("%s: the overlay was offered the drag\n", __FUNCTION__);
@@ -736,6 +1296,10 @@ static void
 DeviceLeave(void *d,                    // IN: unused
             struct wl_data_device *dd)  // IN: unused
 {
+   if (gDrag.dtShown) {
+      DropTargetLeave();
+      return;
+   }
    g_debug("%s: the drag left the overlay\n", __FUNCTION__);
    gDrag.overlayEntered = FALSE;
    OfferDestroy(gDrag.offer);
@@ -749,12 +1313,19 @@ DeviceMotion(void *d,                    // IN: unused
              wl_fixed_t x,               // IN: unused
              wl_fixed_t y)               // IN: unused
 {
+   if (gDrag.dtShown) {
+      DropTargetMotion();
+   }
 }
 
 static void
 DeviceDrop(void *d,                    // IN: unused
            struct wl_data_device *dd)  // IN: unused
 {
+   if (gDrag.dtShown) {
+      DropTargetDrop();
+      return;
+   }
    g_warning("%s: the overlay took the drop meant for the target\n",
              __FUNCTION__);
 }
@@ -1007,6 +1578,23 @@ PointerEnter(void *data,                  // IN: unused
              wl_fixed_t y)                // IN: unused
 {
    gDrag.focus = surface;
+   if (gDrag.dtShown) {
+      gDrag.dtReached = TRUE;
+   }
+
+   /*
+    * During a drag the compositor gives no client the pointer, so the
+    * pointer on the drop target means no drag is running, or the drag has
+    * just dropped. Let the pointer
+    * through, so that the drop target, which covers the output, does not
+    * take the clicks meant for the windows under it.
+    */
+   if (gDrag.dtShown && gDrag.dtInput &&
+       (gDrag.dtOffer == NULL || gDrag.dtDropped)) {
+      g_debug("%s: the pointer reached the drop target with no drag\n",
+              __FUNCTION__);
+      WaylandDrag_DropTargetSetInput(FALSE);
+   }
 }
 
 
@@ -1053,6 +1641,13 @@ PointerButton(void *data,                 // IN: unused
 {
    size_t i;
 
+   /*
+    * Only an armed drag source starts a drag. A press on the drop target, or
+    * on overlays with nothing on offer, would start an empty drag.
+    */
+   if (gDrag.dtShown || gDrag.nItems == 0) {
+      return;
+   }
    if (state != WL_POINTER_BUTTON_STATE_PRESSED ||
        gDrag.dragging || gDrag.focus == NULL || gDrag.source != NULL) {
       return;
@@ -1583,6 +2178,7 @@ Disconnect(void)
    DestroyProxy(gDrag.registry);
    wl_display_disconnect(gDrag.display);
    memset(&gDrag, 0, sizeof gDrag);
+   gDrag.dtFd = -1;
 }
 
 
@@ -1624,6 +2220,7 @@ WaylandDrag_Init(void)
       return FALSE;
    }
    memset(&gDrag, 0, sizeof gDrag);
+   gDrag.dtFd = -1;
 
    gDrag.display = wl_display_connect(name);
    if (gDrag.display == NULL) {
@@ -1731,6 +2328,8 @@ WaylandDrag_Exit(void)
    }
    OfferDestroy(gDrag.offer);
    gDrag.offer = NULL;
+   DropForgetOffer();
+   gDrag.dtShown = FALSE;
    FreeItems();
    Disconnect();
 
@@ -1833,6 +2432,11 @@ WaylandDrag_Arm(const WaylandDragItem *items,  // IN
    if (gDrag.dragging) {
       g_debug("%s: a drag is already running\n", __FUNCTION__);
       return FALSE;
+   }
+   /* The drag source and the drop target share the overlays. */
+   if (gDrag.dtShown) {
+      g_debug("%s: hiding the drop target for the drag\n", __FUNCTION__);
+      WaylandDrag_HideDropTarget();
    }
    WaylandDrag_Disarm();
 
@@ -2241,7 +2845,11 @@ WaylandDrag_Refocus(unsigned int timeoutMs,        // IN
 void
 WaylandDrag_Disarm(void)
 {
-   if (gDrag.display == NULL || gDrag.dragging) {
+   /*
+    * Nothing can be armed while the drop target is shown, and Unmap() below
+    * would take its overlays.
+    */
+   if (gDrag.display == NULL || gDrag.dragging || gDrag.dtShown) {
       return;
    }
    gDrag.done = NULL;
@@ -2282,4 +2890,249 @@ WaylandDrag_Cancel(void)
    }
    g_debug("%s: ending the drag\n", __FUNCTION__);
    Finish();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WaylandDrag_ShowDropTarget --
+ *
+ *    Map a transparent overlay on every output as a drop target for the
+ *    drag the guest's pointer holds.
+ *
+ *    A Wayland client cannot place a surface at the pointer, so the drop
+ *    target covers every output, as the drag source does. The caller then
+ *    moves the pointer. The compositor offers the drag to the surface under
+ *    the pointer only on a motion.
+ *
+ * Results:
+ *    TRUE if the drop target is shown.
+ *
+ * Side effects:
+ *    The callbacks run from the main loop until
+ *    WaylandDrag_HideDropTarget().
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+WaylandDrag_ShowDropTarget(WaylandDropDataFunc gotData,    // IN/OPT
+                           WaylandDropEventFunc dropped,   // IN/OPT
+                           WaylandDropEventFunc left,      // IN/OPT
+                           void *clientData)               // IN
+{
+   gint64 deadline;
+   size_t i;
+   int r;
+
+   if (!gDrag.inited) {
+      return FALSE;
+   }
+   if (gDrag.dragging || gDrag.nItems > 0 || gDrag.source != NULL) {
+      g_debug("%s: the drag source has the overlays\n", __FUNCTION__);
+      return FALSE;
+   }
+
+   gDrag.dtOnData = gotData;
+   gDrag.dtOnDrop = dropped;
+   gDrag.dtOnLeave = left;
+   gDrag.dtClientData = clientData;
+   if (gDrag.dtShown) {
+      /* A drag the host cannot take stays let through. */
+      WaylandDrag_DropTargetSetInput(!(gDrag.dtOffer != NULL &&
+                                       gDrag.dtUnusable));
+      return TRUE;
+   }
+
+   gDrag.dtShown = TRUE;
+   gDrag.dtInput = TRUE;
+   gDrag.dtDropped = FALSE;
+   gDrag.dtReached = FALSE;
+   for (i = 0; i < gDrag.nOverlays; i++) {
+      MakeOverlay(&gDrag.overlays[i]);
+   }
+
+   /*
+    * As in WaylandDrag_Arm(), the first sync brings the configure and the
+    * second the commit that maps the overlay.
+    */
+   deadline = g_get_monotonic_time() + WAYLAND_DRAG_REPLY_TIMEOUT_MS * 1000;
+   r = SyncUntil(deadline);
+   if (r == 1) {
+      r = SyncUntil(deadline);
+   }
+   if (r < 0) {
+      g_warning("%s: lost the compositor connection\n", __FUNCTION__);
+      WaylandDrag_Exit();
+      return FALSE;
+   }
+   if (!gDrag.mapped) {
+      g_debug("%s: the drop target did not map\n", __FUNCTION__);
+      WaylandDrag_HideDropTarget();
+      return FALSE;
+   }
+
+   g_debug("%s: native drop target shown on %u outputs\n", __FUNCTION__,
+           (unsigned) gDrag.nOverlays);
+
+   return TRUE;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WaylandDrag_HideDropTarget --
+ *
+ *    Destroy the drop target's overlays, and any offer it holds. A drag
+ *    still over it moves on to the surface under the pointer.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WaylandDrag_HideDropTarget(void)
+{
+   if (!gDrag.dtShown) {
+      return;
+   }
+   DropForgetOffer();
+   gDrag.dtShown = FALSE;
+   gDrag.dtInput = FALSE;
+   gDrag.dtOnData = NULL;
+   gDrag.dtOnDrop = NULL;
+   gDrag.dtOnLeave = NULL;
+   gDrag.dtClientData = NULL;
+   Unmap();
+   g_debug("%s: native drop target hidden\n", __FUNCTION__);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WaylandDrag_DropTargetShown, WaylandDrag_DropTargetHasDrag,
+ * WaylandDrag_DropTargetDropped --
+ *
+ *    Report the drop target's state. See waylandDrag.h.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+WaylandDrag_DropTargetShown(void)
+{
+   return gDrag.dtShown;
+}
+
+
+gboolean
+WaylandDrag_DropTargetHasDrag(void)
+{
+   return gDrag.dtShown && gDrag.dtOffer != NULL;
+}
+
+
+gboolean
+WaylandDrag_DropTargetReached(void)
+{
+   return gDrag.dtShown && gDrag.dtReached;
+}
+
+
+gboolean
+WaylandDrag_DropTargetDropped(void)
+{
+   return gDrag.dtShown && gDrag.dtDropped;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WaylandDrag_DropTargetSetInput --
+ *
+ *    Set the overlays' input region to the whole surface, or to nothing.
+ *    sway and KWin honour an empty input region, as HideOverlays() relies
+ *    on. The compositor applies the change on the next pointer motion.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+WaylandDrag_DropTargetSetInput(gboolean input)   // IN
+{
+   struct wl_region *empty = NULL;
+   size_t i;
+
+   if (!gDrag.dtShown || gDrag.dtInput == input) {
+      return;
+   }
+   if (!input) {
+      empty = wl_compositor_create_region(gDrag.compositor);
+   }
+   for (i = 0; i < gDrag.nOverlays; i++) {
+      if (gDrag.overlays[i].surface != NULL) {
+         /* A NULL region is an infinite one. */
+         wl_surface_set_input_region(gDrag.overlays[i].surface, empty);
+         wl_surface_commit(gDrag.overlays[i].surface);
+      }
+   }
+   if (empty != NULL) {
+      wl_region_destroy(empty);
+   }
+   gDrag.dtInput = input;
+   wl_display_flush(gDrag.display);
+   g_debug("%s: the drop target %s the pointer\n", __FUNCTION__,
+           input ? "takes" : "lets through");
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WaylandDrag_DropTargetHasData --
+ *
+ *    Whether the drop target holds a drag whose contents it has read in
+ *    full and that has not dropped.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+WaylandDrag_DropTargetHasData(void)
+{
+   return WaylandDrag_DropTargetHasDrag() && gDrag.dtHaveData &&
+          !gDrag.dtDropped;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WaylandDrag_DropTargetResend --
+ *
+ *    Run gotData() again with the contents of the drag the drop target
+ *    holds. The compositor sends enter only once while the drag stays on the
+ *    drop target, so a caller that has to tell the host again about the same
+ *    drag gets the contents from here.
+ *
+ * Results:
+ *    TRUE if gotData() ran.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+WaylandDrag_DropTargetResend(void)
+{
+   if (!WaylandDrag_DropTargetHasData() || gDrag.dtOnData == NULL) {
+      return FALSE;
+   }
+   g_debug("%s: handing over %u bytes of %s again\n", __FUNCTION__,
+           gDrag.dtData->len, gDrag.dtMime);
+   DropDeliver();
+
+   return TRUE;
 }

@@ -19,8 +19,8 @@
 /*
  * waylandDragStub.c --
  *
- *    The native drag source for a build without Wayland support. A native
- *    drag is never available, so the caller always uses XDND.
+ *    The native drag source and drop target for a build without Wayland
+ *    support. Neither is ever available, so the caller always uses XDND.
  */
 
 #include "waylandDrag.h"
@@ -101,5 +101,69 @@ WaylandDrag_Disarm(void)
 
 void
 WaylandDrag_Cancel(void)
+{
+}
+
+
+gboolean
+WaylandDrag_ShowDropTarget(WaylandDropDataFunc gotData,    // IN: unused
+                           WaylandDropEventFunc dropped,   // IN: unused
+                           WaylandDropEventFunc left,      // IN: unused
+                           void *clientData)               // IN: unused
+{
+   return FALSE;
+}
+
+
+void
+WaylandDrag_HideDropTarget(void)
+{
+}
+
+
+gboolean
+WaylandDrag_DropTargetShown(void)
+{
+   return FALSE;
+}
+
+
+gboolean
+WaylandDrag_DropTargetHasData(void)
+{
+   return FALSE;
+}
+
+
+gboolean
+WaylandDrag_DropTargetResend(void)
+{
+   return FALSE;
+}
+
+
+gboolean
+WaylandDrag_DropTargetHasDrag(void)
+{
+   return FALSE;
+}
+
+
+gboolean
+WaylandDrag_DropTargetReached(void)
+{
+   return FALSE;
+}
+
+
+gboolean
+WaylandDrag_DropTargetDropped(void)
+{
+   return FALSE;
+}
+
+
+void
+WaylandDrag_DropTargetSetInput(gboolean input)   // IN: unused
 {
 }
