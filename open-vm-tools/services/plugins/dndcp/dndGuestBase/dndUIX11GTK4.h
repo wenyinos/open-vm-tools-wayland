@@ -49,6 +49,7 @@ extern "C" {
 #include "dragDetWndX11GTK4.h"
 
 struct DblLnkLst_Links;
+struct DnDGHRead;
 
 /**
  * The DnDUI class implements the UI portion of DnD V3 and greater
@@ -65,6 +66,13 @@ public:
    void SetDnDAllowed(bool isDnDAllowed)
       {ASSERT(mDnD); mDnD->SetDnDAllowed(isDnDAllowed);}
    void SetBlockControl(DnDBlockControl *blockCtrl);
+
+   /*
+    * Called from the async guest to host read callbacks, which are not
+    * members of the class.
+    */
+   void OnGHDropRead(const char *data, const char *type);
+   void ForgetGHRead(DnDGHRead *read);
 
 private:
    /*
@@ -150,6 +158,8 @@ private:
    bool SetCPClipboardFromGtk_PlainText(utf::string &source);
    bool SetCPClipboardFromGtk_RTF(utf::string &source);
    bool SetCPClipboardFromGtk(std::string &data, std::string &drop_type);
+   void StartGHRead(const Glib::RefPtr< Gdk::Drop > &drop);
+   void CancelGHRead(void);
 
    utf::string GetLastDirName(const utf::string &str);
    utf::utf8string GetNextPath(utf::utf8string &str, size_t& index);
@@ -186,6 +196,8 @@ private:
    /* Icon updates from the guest. */
    /* Only update mouse when we have clipboard contents from the host. */
    bool mGHDnDDataReceived;
+   GCancellable *mGHReadCancel;
+   GSList *mGHReads;
    bool mInHGDrag;
    // Flag to indicate if H->G drag has been triggered in guest by simulate mouse press
    bool mHGDragStarted;

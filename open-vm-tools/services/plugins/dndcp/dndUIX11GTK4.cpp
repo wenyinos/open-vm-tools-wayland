@@ -76,6 +76,8 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
       mBlockAdded(false),
       mGHDnDInProgress(false),
       mGHDnDDataReceived(false),
+      mGHReadCancel(NULL),
+      mGHReads(NULL),
       mInHGDrag(false),
       mHGButtonDown(false),
       mEffect(DROP_NONE),
@@ -279,6 +281,7 @@ DnDUIX11::ResetUI()
    mGHDnDInProgress = false;
    mEffect = DROP_NONE;
    mInHGDrag = false;
+   CancelGHRead();
    RemoveBlock();
 }
 
@@ -1180,6 +1183,445 @@ DnDUIX11::OnGtkSrcDragCancel(const Glib::RefPtr< Gdk::Drag > &drag,
 /*
  *-----------------------------------------------------------------------------
  *
+ * Reading what is dragged from the guest.
+ *
+ *    GTK would read the value itself, and for a file list it prefers
+ *    application/vnd.portal.filetransfer, which KDE and GTK4 applications
+ *    offer next to text/uri-list. gdk_drop_read_value_async() with
+ *    GDK_TYPE_FILE_LIST picks the portal type, fetches its token over
+ *    XdndSelection, then fails to redeem the token with "Unable to open
+ *    /proc/<pid>/root".
+ *
+ *    The document portal authenticates a caller by opening /proc/<pid>/root,
+ *    which fails here. vmusr is exec'd by a setuid wrapper, and that clears
+ *    the kernel's dumpable flag. /proc/<pid> then stays owned by root even
+ *    after the process drops back to the user.
+ *
+ *    So a file list is read as text/uri-list. The source offers it, it needs
+ *    no portal, and it comes over the same XdndSelection transfer. A drag
+ *    with no text/uri-list is read as a string, which GDK converts from
+ *    whatever text type the source offers.
+ *
+ *    The uri-list stream has to be drained asynchronously.
+ *    gdk_drop_read_finish() warns against blocking reads on the returned
+ *    stream in the GTK thread, and a synchronous drain here deadlocks the
+ *    main loop.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+#define DND_URI_LIST_CHUNK   (16 * 1024)
+#define DND_URI_LIST_MAX     (1 << 20)
+
+/*
+ * DnDUIX11::CancelGHRead() clears ui when the drag ends or the object is
+ * destroyed, so a callback that is already queued finds NULL rather than a
+ * destroyed object. The read holds its own reference to the cancellable
+ * rather than reading it back from the UI, so that starting a new read cannot
+ * swap in a different one.
+ */
+typedef struct DnDGHRead {
+   DnDUIX11 *ui;
+   GCancellable *cancel;
+   /* The type handed to DnDUIX11::OnGHDropRead(). */
+   const char *type;
+   /* For a uri-list only. */
+   GInputStream *stream;
+   GString *acc;
+} DnDGHRead;
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDGHReadFree --
+ *
+ *    Free a read, and take it off the UI's list of reads in progress.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DnDGHReadFree(DnDGHRead *rd)  // IN
+{
+   if (rd == NULL) {
+      return;
+   }
+   if (rd->ui != NULL) {
+      rd->ui->ForgetGHRead(rd);
+      rd->ui = NULL;
+   }
+   if (rd->stream != NULL) {
+      /*
+       * Closing can make a round trip to the drag source, and this stream
+       * must not see a blocking call on the GTK thread. Dropping the
+       * reference is enough, because GIO closes the stream when it is
+       * finalized.
+       */
+      g_object_unref(rd->stream);
+   }
+   if (rd->cancel != NULL) {
+      g_object_unref(rd->cancel);
+   }
+   if (rd->acc != NULL) {
+      g_string_free(rd->acc, TRUE);
+   }
+   g_free(rd);
+}
+
+
+static void DnDUriListReadChunk(GObject *source, GAsyncResult *res, gpointer data);
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUriListPump --
+ *
+ *    Ask for the next chunk of the uri-list.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    DnDUriListReadChunk() runs when the chunk arrives.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DnDUriListPump(DnDGHRead *rd)  // IN
+{
+   g_input_stream_read_bytes_async(rd->stream, DND_URI_LIST_CHUNK,
+                                   G_PRIORITY_DEFAULT, rd->cancel,
+                                   DnDUriListReadChunk, rd);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUriListReadChunk --
+ *
+ *    Add a chunk to the uri-list, and at the end of the stream hand the list
+ *    to the UI.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    Frees the read once it is over.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DnDUriListReadChunk(GObject *source,       // IN: the GInputStream
+                    GAsyncResult *res,     // IN
+                    gpointer data)         // IN: DnDGHRead *
+{
+   DnDGHRead *rd = (DnDGHRead *) data;
+   GError *error = NULL;
+   GBytes *bytes = g_input_stream_read_bytes_finish(G_INPUT_STREAM(source),
+                                                    res, &error);
+
+   if (bytes == NULL) {
+      g_debug("%s: read failed: %s\n", __FUNCTION__,
+              error != NULL ? error->message : "unknown");
+      g_clear_error(&error);
+      DnDGHReadFree(rd);
+      return;
+   }
+
+   gsize len = g_bytes_get_size(bytes);
+
+   if (len > 0) {
+      gsize n;
+      const char *p = (const char *) g_bytes_get_data(bytes, &n);
+
+      g_string_append_len(rd->acc, p, n);
+      g_bytes_unref(bytes);
+
+      if (rd->acc->len > DND_URI_LIST_MAX) {
+         g_warning("%s: uri list is implausibly large, giving up\n",
+                   __FUNCTION__);
+         DnDGHReadFree(rd);
+         return;
+      }
+      DnDUriListPump(rd);
+      return;
+   }
+
+   /* Zero bytes means end of stream. */
+   g_bytes_unref(bytes);
+   g_debug("%s: got %" G_GSIZE_FORMAT " bytes of text/uri-list\n",
+           __FUNCTION__, (gsize) rd->acc->len);
+   if (rd->ui != NULL) {
+      rd->ui->OnGHDropRead(rd->acc->str, rd->type);
+   }
+   DnDGHReadFree(rd);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUriListGotStream --
+ *
+ *    The source has started sending the uri-list. Read it.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    Frees the read if there is no stream.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DnDUriListGotStream(GObject *source,      // IN: the GdkDrop
+                    GAsyncResult *res,    // IN
+                    gpointer data)        // IN: DnDGHRead *
+{
+   DnDGHRead *rd = (DnDGHRead *) data;
+   GError *error = NULL;
+   const char *mime = NULL;
+   GInputStream *stream = gdk_drop_read_finish(GDK_DROP(source), res,
+                                               &mime, &error);
+
+   if (stream == NULL) {
+      g_debug("%s: no stream: %s\n", __FUNCTION__,
+              error != NULL ? error->message : "unknown");
+      g_clear_error(&error);
+      DnDGHReadFree(rd);
+      return;
+   }
+
+   g_debug("%s: reading drop as %s\n", __FUNCTION__,
+           mime != NULL ? mime : DRAG_TARGET_NAME_URI_LIST);
+   rd->stream = stream;
+   DnDUriListPump(rd);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDTextGotValue --
+ *
+ *    The dragged text has arrived. Hand it to the UI.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    Frees the read.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+DnDTextGotValue(GObject *source,      // IN: the GdkDrop
+                GAsyncResult *res,    // IN
+                gpointer data)        // IN: DnDGHRead *
+{
+   DnDGHRead *rd = (DnDGHRead *) data;
+   GError *error = NULL;
+   const GValue *value = gdk_drop_read_value_finish(GDK_DROP(source), res,
+                                                    &error);
+
+   if (value == NULL || !G_VALUE_HOLDS_STRING(value)) {
+      g_debug("%s: no text: %s\n", __FUNCTION__,
+              error != NULL ? error->message : "unknown");
+      g_clear_error(&error);
+      DnDGHReadFree(rd);
+      return;
+   }
+
+   g_debug("%s: got the text as %s\n", __FUNCTION__, rd->type);
+   if (rd->ui != NULL) {
+      rd->ui->OnGHDropRead(g_value_get_string(value), rd->type);
+   }
+   DnDGHReadFree(rd);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::StartGHRead --
+ *
+ *    Begin fetching what the guest is dragging, as a text/uri-list when the
+ *    source offers one, and otherwise as text.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    OnGHDropRead() runs when the data has arrived.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::StartGHRead(const Glib::RefPtr< Gdk::Drop > &drop)  // IN
+{
+   static const char *mimes[] = { DRAG_TARGET_NAME_URI_LIST, NULL };
+   GdkContentFormats *formats = gdk_drop_get_formats(drop->gobj());
+   DnDGHRead *rd;
+
+   /* Cancel any previous read, which is stale now. */
+   CancelGHRead();
+   mGHReadCancel = g_cancellable_new();
+
+   rd = g_new0(DnDGHRead, 1);
+   rd->ui = this;
+   rd->cancel = G_CANCELLABLE(g_object_ref(mGHReadCancel));
+   mGHReads = g_slist_prepend(mGHReads, rd);
+
+   if (gdk_content_formats_contain_mime_type(formats,
+                                             DRAG_TARGET_NAME_URI_LIST)) {
+      rd->type = DRAG_TARGET_NAME_URI_LIST;
+      rd->acc = g_string_new(NULL);
+      gdk_drop_read_async(drop->gobj(), (const char **) mimes,
+                          G_PRIORITY_DEFAULT, rd->cancel,
+                          DnDUriListGotStream, rd);
+      return;
+   }
+
+   /*
+    * GDK hands RTF over only as the text GTK converts it to. The type says
+    * which of SetCPClipboardFromGtk()'s paths takes it, and matches what
+    * DragDetWnd::Get_Drop_Value() reports for the same drop.
+    */
+   rd->type = gdk_content_formats_contain_mime_type(formats,
+                                                    TARGET_NAME_TEXT_RTF)
+              ? TARGET_NAME_TEXT_RTF : TARGET_NAME_STRING;
+   gdk_drop_read_value_async(drop->gobj(), G_TYPE_STRING, G_PRIORITY_DEFAULT,
+                             rd->cancel, DnDTextGotValue, rd);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::CancelGHRead --
+ *
+ *      Abandon any outstanding guest to host data read.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::CancelGHRead(void)
+{
+   GSList *l;
+
+   /*
+    * Detach first. A callback whose result was already queued when the cancel
+    * arrived still runs, and must not reach this object once the drag is over
+    * or the object is being destroyed. Each read frees itself in its own
+    * callback.
+    */
+   for (l = mGHReads; l != NULL; l = l->next) {
+      ((DnDGHRead *) l->data)->ui = NULL;
+   }
+   g_slist_free(mGHReads);
+   mGHReads = NULL;
+
+   if (mGHReadCancel != NULL) {
+      g_cancellable_cancel(mGHReadCancel);
+      g_object_unref(mGHReadCancel);
+      mGHReadCancel = NULL;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::ForgetGHRead --
+ *
+ *    Drop a finished read from the live list.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::ForgetGHRead(DnDGHRead *read)  // IN
+{
+   mGHReads = g_slist_remove(mGHReads, read);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::OnGHDropRead --
+ *
+ *      What the guest is dragging has arrived. Turn it into the
+ *      cross-platform clipboard and tell the host, which is what
+ *      OnGtkDragDataReceived() did when GTK preloaded the value.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      May start a guest to host drag with the host, or reset the UI.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::OnGHDropRead(const char *data,   // IN
+                       const char *type)   // IN: a TARGET_NAME_* type
+{
+   std::string value(data != NULL ? data : "");
+   std::string valueType(type);
+
+   if (!mGHDnDInProgress) {
+      g_debug("%s: drag already finished\n", __FUNCTION__);
+      return;
+   }
+   if (value.empty()) {
+      g_debug("%s: nothing to send\n", __FUNCTION__);
+      ResetUI();
+      return;
+   }
+   if (!SetCPClipboardFromGtk(value, valueType)) {
+      g_debug("%s: failed to set CP clipboard\n", __FUNCTION__);
+      ResetUI();
+      return;
+   }
+   if (CPClipboard_IsEmpty(&mClipboard)) {
+      g_debug("%s: clipboard came out empty\n", __FUNCTION__);
+      ResetUI();
+      return;
+   }
+   if (!mGHDnDDataReceived) {
+      g_debug("%s: drag entering, telling the host\n", __FUNCTION__);
+      mGHDnDDataReceived = true;
+      TargetDragEnter();
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * DnDUIX11::OnGtkDragAccept --
  *
  *      GTK4 "signal_accept" signal handler for DropTarget.
@@ -1229,6 +1671,13 @@ DnDUIX11::OnGtkDragAccept(const Glib::RefPtr< Gdk::Drop > &drop, void *ctx)
    /* Need to grab all of the data. */
    CPClipboard_Clear(&this_instance->mClipboard);
    this_instance->mNumPendingRequest = 0;
+
+   /*
+    * Fetch the data here rather than through GTK's preload, which picks the
+    * portal type for a file list and cannot redeem it. See "Reading what is
+    * dragged from the guest" above.
+    */
+   this_instance->StartGHRead(drop);
    return true;
 }
 

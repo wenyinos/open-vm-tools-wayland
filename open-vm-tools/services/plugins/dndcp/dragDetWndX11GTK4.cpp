@@ -93,8 +93,13 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
    types.push_back(G_TYPE_FILE);
    types.push_back(G_TYPE_STRING);
    mTarget->set_gtypes(types);
-   // Let GTK preload data early.
-   mTarget->set_preload(true);
+   /*
+    * No preload. GTK would read the value itself on enter, and from a KDE
+    * source it picks application/vnd.portal.filetransfer, which fails here.
+    * DnDUIX11::StartGHRead() reads text/uri-list or text instead. The gtypes
+    * above still decide whether a drop is accepted.
+    */
+   mTarget->set_preload(false);
 
 /* Need to check USE_UINPUT, as FreeBSD does not support this */
 #ifdef USE_UINPUT
