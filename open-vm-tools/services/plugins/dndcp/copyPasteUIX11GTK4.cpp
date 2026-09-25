@@ -897,6 +897,35 @@ CopyPasteUIX11::CopyPasteSendFile(const Glib::RefPtr<Gio::AsyncResult>& result) 
 /*
  *-----------------------------------------------------------------------------
  *
+ * LocalOffersGnomeFileList --
+ * LocalOffersKdeFileList --
+ *
+ *      Which renderings of a host file list the clipboard offers under the
+ *      desktop XDG_CURRENT_DESKTOP names. GNOME gets the GNOME ones and KDE
+ *      the plain URI list. Any other desktop, or none, gets both, since its
+ *      file manager may read either.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+LocalOffersGnomeFileList(const char *desktop)   // IN/OPT
+{
+   return desktop == NULL || strstr(desktop, "KDE") == NULL ||
+          strstr(desktop, "GNOME") != NULL;
+}
+
+
+static bool
+LocalOffersKdeFileList(const char *desktop)   // IN/OPT
+{
+   return desktop == NULL || strstr(desktop, "GNOME") == NULL;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * CopyPasteUIX11::LocalSetFileListToClipboard --
  *
  *      API to set the guest clipboard with file list.
@@ -923,19 +952,17 @@ CopyPasteUIX11::LocalSetFileListToClipboard(const char* desktop)   // IN
    g_debug("%s: enter.\n", __FUNCTION__);
    g_debug("%s: Desktop = %s\n", __FUNCTION__, desktop);
 
-   if (desktop && strstr(desktop, "GNOME")) {
+   if (LocalOffersGnomeFileList(desktop)) {
       // Set the Gnome file list to GDKContentProvider
       fileListGnome = Glib::Bytes::create(mHGCopiedUriListGnome.c_str(), mHGCopiedUriListGnome.bytes());
       fileListNautilus = Glib::Bytes::create(mHGCopiedUriListNautilus.c_str(), mHGCopiedUriListNautilus.bytes());
       provider.push_back(Gdk::ContentProvider::create(FCP_TARGET_NAME_GNOME_COPIED_FILES, fileListGnome));
       provider.push_back(Gdk::ContentProvider::create(FCP_TARGET_NAME_NAUTILUS_GTK4_UTF8, fileListNautilus));
-   } else if (desktop && strstr(desktop, "KDE")) {
+   }
+   if (LocalOffersKdeFileList(desktop)) {
       // Set the Kde file list to GDKContentProvider
       fileListKde = Glib::Bytes::create(mHGCopiedUriListKde.c_str(), mHGCopiedUriListKde.bytes());
       provider.push_back(Gdk::ContentProvider::create(FCP_TARGET_NAME_URI_LIST, fileListKde));
-   } else {
-      g_warning("%s: Unsupported Desktop Manager %s. \n", __FUNCTION__, desktop);
-      return;
    }
 
    providerUnion = Gdk::ContentProvider::create(provider);
@@ -1097,7 +1124,7 @@ CopyPasteUIX11::LocalGetFileRequest()
          return;
       }
 
-      if (desktop && strstr(desktop, "GNOME")) {
+      if (LocalOffersGnomeFileList(desktop)) {
          /* Setting Gnome URIs for each path in the guest's file list. */
          mHGCopiedUriListGnome = "copy\n";
 	 BuildFileURIList(mHGCopiedUriListGnome, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST, stagingDirName);
@@ -1110,14 +1137,13 @@ CopyPasteUIX11::LocalGetFileRequest()
 	 /* Setting Nautilus URIs for each path in the guest's file list. */
          mHGCopiedUriListNautilus = utf::string(FCP_TARGET_MIME_NAUTILUS_FILES) + "\ncopy\n";
 	 BuildFileURIList(mHGCopiedUriListNautilus, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST, stagingDirName);
-      } else if (desktop && strstr(desktop, "KDE")) {
+      }
+      if (LocalOffersKdeFileList(desktop)) {
          /* Setting KDE URIs for each path in the guest's file list. */
+         mHGCopiedUriListKde = "";
 	 BuildFileURIList(mHGCopiedUriListKde, DND_URI_LIST_PRE_KDE, DND_URI_LIST_POST, stagingDirName);
 	 g_debug("%s: providing file list [%s]\n", __FUNCTION__,
                  mHGCopiedUriListKde.c_str());
-      } else {
-	 g_warning("%s: Unsupported Desktop Manager %s. \n", __FUNCTION__, desktop);
-         return;
       }
    }
 
@@ -1323,7 +1349,7 @@ CopyPasteUIX11::LocalGetFileContentsRequest()
 
    const char *desktop = getenv("XDG_CURRENT_DESKTOP");
 
-   if (desktop && strstr(desktop, "GNOME")) {
+   if (LocalOffersGnomeFileList(desktop)) {
       /* Setting Gnome URIs for each path in the guest's file list. */
       mHGCopiedUriListGnome = "copy\n";
       BuildFileContentURIList(mHGCopiedUriListGnome, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST);
@@ -1335,13 +1361,12 @@ CopyPasteUIX11::LocalGetFileContentsRequest()
       /* Setting Nautilus URIs for each path in the guest's file list. */
       mHGCopiedUriListNautilus = utf::string(FCP_TARGET_MIME_NAUTILUS_FILES) + "\ncopy\n";
       BuildFileContentURIList(mHGCopiedUriListNautilus, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST);
-   } else if (desktop && strstr(desktop, "KDE")) {
+   }
+   if (LocalOffersKdeFileList(desktop)) {
       /* Setting KDE URIs for each path in the guest's file list. */
+      mHGCopiedUriListKde = "";
       BuildFileContentURIList(mHGCopiedUriListKde, DND_URI_LIST_PRE_KDE, DND_URI_LIST_POST);
       g_debug("%s: providing file list [%s]\n", __FUNCTION__, mHGCopiedUriListKde.c_str());
-   } else {
-      g_warning("%s: Unsupported Desktop Manager %s. \n", __FUNCTION__, desktop);
-      return;
    }
 
    /* Set the content of clipboard with the File URI's. */

@@ -357,8 +357,7 @@ void
 DnDUIX11::LocalSetContentProvider(const char* desktop)   // IN
 {
    std::vector<Glib::RefPtr<Gdk::ContentProvider>> providerVec;
-   Glib::RefPtr<Glib::Bytes> fileListGnome;
-   Glib::RefPtr<Glib::Bytes> fileListKde;
+   Glib::RefPtr<Glib::Bytes> fileList;
    void *buf;
    size_t sz;
 
@@ -366,18 +365,9 @@ DnDUIX11::LocalSetContentProvider(const char* desktop)   // IN
 
    if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILELIST) ||
        CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILECONTENTS)) {
-      if (desktop && strstr(desktop, "GNOME")) {
-         // Set the Gnome file list to GDKContentProvider
-         fileListGnome = Glib::Bytes::create(mHGDndUriList.c_str(), mHGDndUriList.bytes());
-         providerVec.push_back(Gdk::ContentProvider::create(DRAG_TARGET_NAME_URI_LIST, fileListGnome));
-      } else if (desktop && strstr(desktop, "KDE")) {
-         // Set the Kde file list to GDKContentProvider
-         fileListKde = Glib::Bytes::create(mHGDndUriList.c_str(), mHGDndUriList.bytes());
-         providerVec.push_back(Gdk::ContentProvider::create(DRAG_TARGET_NAME_URI_LIST, fileListKde));
-      } else {
-         g_warning("%s: Unsupported Desktop Manager %s. \n", __FUNCTION__, desktop);
-         return;
-      }
+      /* The caller has already framed the list for this desktop. */
+      fileList = Glib::Bytes::create(mHGDndUriList.c_str(), mHGDndUriList.bytes());
+      providerVec.push_back(Gdk::ContentProvider::create(DRAG_TARGET_NAME_URI_LIST, fileList));
    } else if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_RTF)) {
       if (CPClipboard_GetItem(&mClipboard, CPFORMAT_RTF, &buf, &sz)) {
          g_debug("%s: RTF data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
@@ -506,7 +496,15 @@ DnDUIX11::LocalGetFileRequest(utf::string stagingDirName,
       BuildFileURIList(mHGDndUriList, DND_URI_LIST_PRE_KDE, DND_URI_LIST_POST, stagingDirName);
       g_debug("%s: providing file list [%s]\n", __FUNCTION__, mHGDndUriList.c_str());
    } else {
-      g_warning("%s: Unsupported Desktop Manager %s. \n", __FUNCTION__, desktop);
+      /*
+       * Both cases above depart from text/uri-list. GNOME separates entries
+       * with a bare newline, and KDE drops the authority. Any other desktop
+       * gets the form the type specifies.
+       */
+      BuildFileURIList(mHGDndUriList, DND_URI_LIST_PRE, DND_URI_LIST_POST, stagingDirName);
+      g_debug("%s: %s, providing file list [%s]\n", __FUNCTION__,
+              desktop != NULL ? desktop : "no XDG_CURRENT_DESKTOP",
+              mHGDndUriList.c_str());
    }
 }
 
@@ -553,7 +551,10 @@ DnDUIX11::LocalGetFileContentsRequest(const char *desktop)
       BuildFileContentURIList(mHGDndUriList, DND_URI_LIST_PRE_KDE, DND_URI_LIST_POST);
       g_debug("%s: providing file list [%s]\n", __FUNCTION__, mHGDndUriList.c_str());
    } else {
-      g_warning("%s: Unsupported Desktop Manager %s. \n", __FUNCTION__, desktop);
+      BuildFileContentURIList(mHGDndUriList, DND_URI_LIST_PRE, DND_URI_LIST_POST);
+      g_debug("%s: %s, providing file list [%s]\n", __FUNCTION__,
+              desktop != NULL ? desktop : "no XDG_CURRENT_DESKTOP",
+              mHGDndUriList.c_str());
    }
 }
 
