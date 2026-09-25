@@ -92,16 +92,21 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
 {
    TRACE_CALL();
 
-
    /*
     * XXX Hard coded use of default screen means this doesn't work in dual-
     * headed setups (e.g. DISPLAY=:0.1).  However, the number of people running
     * such setups in VMs is expected to be, like, hella small, so I'mma cut
     * corners for now.
+    *
+    * There is no display when DISPLAY is unset. Init() then fails, and drag
+    * and drop stays off.
     */
    Glib::RefPtr<Gdk::Display> display = Gdk::Display::get_default();
-   GdkSurface *gdkSurface = gdk_x11_display_get_default_group(display->gobj());
-   mGdkSurface = Glib::wrap(gdkSurface);
+   if (display && GDK_IS_X11_DISPLAY(display->gobj())) {
+      GdkSurface *gdkSurface =
+         gdk_x11_display_get_default_group(display->gobj());
+      mGdkSurface = Glib::wrap(gdkSurface);
+   }
    UpdateWorkArea();
 }
 
@@ -163,6 +168,12 @@ DnDUIX11::Init()
    bool ret = true;
 
    CPClipboard_Init(&mClipboard);
+
+   /* The detection window is an X11 window. */
+   if (!mGdkSurface) {
+      g_warning("%s: no X display, drag and drop is off\n", __FUNCTION__);
+      return false;
+   }
 
    GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
    ASSERT(p);
@@ -681,7 +692,7 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
    mDetWnd->RefreshScreenSize();
 
    /* Move detect window to the mouse in position */
-   OnUpdateDetWnd(true, mOriginX, mOriginY);
+   ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
 
    TRACE_CALL();
 
@@ -805,12 +816,41 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
           * otherwise it may be another DnD, not ours. Send a release, then
           * a press here to cover this case.
           */
-         mDetWnd->SimulateXEvents(true, true, false, true, true, x, y);
+         int detX = 0, detY = 0, detW = 0, detH = 0;
+         int pressX = x, pressY = y;
+
+         /*
+          * GTK starts the drag from a press followed by motion on the
+          * detection window itself, so the press has to land on it. A
+          * compositor may put the window somewhere other than the requested
+          * position, and a tiling one does, so press where the window is.
+          */
+         mDetWnd->GetGeometry(detX, detY, detW, detH);
+         if (detW > 0 && detH > 0) {
+            pressX = detX + detW / 2;
+            pressY = detY + detH / 2;
+            if (pressX != x || pressY != y) {
+               g_debug("%s: pressing on the detection window at (%d, %d), "
+                       "not the pointer at (%d, %d)\n", __FUNCTION__,
+                       pressX, pressY, x, y);
+            }
+         }
+         mDetWnd->SimulateXEvents(true, true, false, true, true, pressX, pressY);
          // simulate drag mouse press
-         mDetWnd->SimulateXEvents(false, true, true, false, true, x, y);
+         mDetWnd->SimulateXEvents(false, true, true, false, true, pressX, pressY);
          mHGButtonDown = true;
          // Tell Gtk that a drag should be started from this widget.
-         mDetWnd->StartDrag(mProvider, x, y);
+         mDetWnd->StartDrag(mProvider, pressX, pressY);
+
+         /*
+          * Put the pointer back where the host has it. The press had to
+          * land on the detection window, but the drag follows the pointer
+          * from here. Waiting for the next motion from the host leaves the
+          * XDND handshake less time than it needs before the host drops.
+          */
+         if (pressX != x || pressY != y) {
+            mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
+         }
          mHGDragStarted = true;
       }
       if (mEffect != DROP_MOVE) {
@@ -848,11 +888,11 @@ DnDUIX11::OnSrcCancel()
     * flybacks when we cancel as user moves mouse in and out of destination
     * window in a H->G DnD.
     */
-   OnUpdateDetWnd(true, mOriginX, mOriginY);
+   ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
    mDetWnd->SimulateXEvents(true, true, false, true, true,
                             mOriginX + DRAG_DET_WINDOW_WIDTH / 2,
                             mOriginY + DRAG_DET_WINDOW_WIDTH / 2);
-   OnUpdateDetWnd(false, 0, 0);
+   ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
    mDetWnd->SimulateXEvents(false, false, false, false, true,
                            mMousePosX, mMousePosY);
    /* The real release has been sent; ResetUI() need not send another. */
@@ -961,16 +1001,16 @@ void
 DnDUIX11::OnSrcDrop()
 {
    TRACE_CALL();
-   OnUpdateDetWnd(true, mOriginX, mOriginY);
+   ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
 
    /*
     * Move the mouse to the saved coordinates, and release the mouse button.
     */
    mDetWnd->SimulateXEvents(false, true, false, false, true,
                             mMousePosX, mMousePosY);
-   OnUpdateDetWnd(false, 0, 0);
    /* The real release has been sent; ResetUI() need not send another. */
    mHGButtonDown = false;
+   ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
    /* We've successful or failure for HG drag, set the flag to false anyway */
    mInHGDrag = false;
 }
@@ -1015,9 +1055,56 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
 /*
  *-----------------------------------------------------------------------------
  *
+ * DnDUIX11::ShowDetWnd --
+ *
+ *      Show or hide the drag detection window in the given role.
+ *
+ * Results:
+ *      Shows/hides and moves detection window.
+ *
+ * Side effects:
+ *      None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::ShowDetWnd(bool show,      // IN: show (true) or hide (false)
+                     int32 x,        // IN: detection window's destination x-coord
+                     int32 y,        // IN: detection window's destination y-coord
+                     DetWndRole role)// IN: what the window is being shown for
+{
+   g_debug("%s: enter 0x%lx show %d x %d y %d role %d\n",
+           __FUNCTION__,
+           mDetWnd->Get_Current_Drop_ctx(), show, x, y, role);
+
+   /* If the window is being shown, move it to the right place. */
+   if (show) {
+      UpdateWorkArea();
+      x = MAX(x - DRAG_DET_WINDOW_WIDTH / 2, mOriginX);
+      y = MAX(y - DRAG_DET_WINDOW_WIDTH / 2, mOriginY);
+      /*
+       * During a host to guest drag the detection window is the drag source,
+       * and nothing needs to find it, so skip the wait for the window
+       * manager. The caller passes the role because mInHGDrag is not set yet
+       * when that drag begins.
+       */
+      mDetWnd->UpdateDetWnd(show, x, y, role == DET_WND_DROP_TARGET);
+   } else {
+      g_debug("%s: hide\n", __FUNCTION__);
+      mDetWnd->UpdateDetWnd(show, x, y);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * DnDUIX11::OnUpdateDetWnd --
  *
- *      Callback to show/hide drag detection window.
+ *      Callback to show/hide drag detection window. This is only wired to the
+ *      common layer's updateDetWndChanged signal, which the host drives on the
+ *      guest to host path, so the window is always a drop target here.
  *
  * Results:
  *      Shows/hides and moves detection window.
@@ -1033,20 +1120,7 @@ DnDUIX11::OnUpdateDetWnd(bool show,     // IN: show (true) or hide (false)
                          int32 x,       // IN: detection window's destination x-coord
                          int32 y)       // IN: detection window's destination y-coord
 {
-   g_debug("%s: enter 0x%lx show %d x %d y %d\n",
-           __FUNCTION__,
-           mDetWnd->Get_Current_Drop_ctx(), show, x, y);
-
-   /* If the window is being shown, move it to the right place. */
-   if (show) {
-      UpdateWorkArea();
-      x = MAX(x - DRAG_DET_WINDOW_WIDTH / 2, mOriginX);
-      y = MAX(y - DRAG_DET_WINDOW_WIDTH / 2, mOriginY);
-      mDetWnd->UpdateDetWnd(show, x, y);
-   } else {
-      g_debug("%s: hide\n", __FUNCTION__);
-      mDetWnd->UpdateDetWnd(show, x, y);
-   }
+   ShowDetWnd(show, x, y, DET_WND_DROP_TARGET);
 }
 
 
@@ -1635,6 +1709,7 @@ DnDUIX11::OnGHDropRead(const char *data,   // IN
 bool
 DnDUIX11::OnGtkDragAccept(const Glib::RefPtr< Gdk::Drop > &drop, void *ctx)
 {
+   g_debug("%s: XDND accept reached the detection window\n", __FUNCTION__);
    DnDUIX11 *this_instance = (DnDUIX11 *)ctx;
    if (!this_instance->mDnD->IsDnDAllowed()) {
       g_warning("%s: No dnd allowed!\n", __FUNCTION__);
@@ -1702,6 +1777,8 @@ DnDUIX11::OnGtkDragEnter(double x, // IN: drag motion x-coord
 {
    DnDUIX11 *this_instance = (DnDUIX11 *)ctx;
    Gdk::DragAction action;
+
+   g_debug("%s: XDND enter at (%f, %f)\n", __FUNCTION__, x, y);
 
    if (this_instance->mDetWnd->Is_Current_Drop_Supported()) {
       action = Gdk::DragAction::COPY;
@@ -2424,7 +2501,8 @@ DnDUIX11::UpdateWorkArea()
    TRACE_CALL();
 
    std::vector<unsigned long> values;
-   if (xutils::GetCardinalList(mGdkSurface, "_NET_WORKAREA", values)
+   if (   mGdkSurface
+       && xutils::GetCardinalList(mGdkSurface, "_NET_WORKAREA", values)
        && values.size() > 0
        && values.size() % 4 == 0) {
       /*

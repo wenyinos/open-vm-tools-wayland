@@ -121,8 +121,18 @@ private:
    void OnGetFilesDone(bool success);
 
    /*
+    * The role the detection window plays while it is shown. A drag has to
+    * find a drop target, but nothing has to find a drag source.
+    */
+   typedef enum {
+      DET_WND_DROP_TARGET,
+      DET_WND_DRAG_SOURCE
+   } DetWndRole;
+
+   /*
     * Callbacks for showing/hiding detection window.
     */
+   void ShowDetWnd(bool bShow, int32 x, int32 y, DetWndRole role);
    void OnUpdateDetWnd(bool bShow, int32 x, int32 y);
    void OnDestMoveDetWndToMousePos();
    void SourceDragStartDone();

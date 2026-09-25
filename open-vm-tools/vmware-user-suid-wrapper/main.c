@@ -202,9 +202,18 @@ StartVMwareUser(char *const envp[])
 
    /* Child */
 
+   /*
+    * A compositor started from a text console, such as sway, leaves
+    * XDG_SESSION_TYPE at "tty", so a Wayland display outside an X11 session
+    * counts too. The plugin chooses its backend the same way.
+    */
    xdgSessionType = getenv("XDG_SESSION_TYPE");
    if (   (xdgSessionType != NULL)
        && (strstr(xdgSessionType, "wayland") != NULL)) {
+      useWayland = TRUE;
+   } else if (   (getenv("WAYLAND_DISPLAY") != NULL)
+              && (   (xdgSessionType == NULL)
+                  || (strcmp(xdgSessionType, "x11") != 0))) {
       useWayland = TRUE;
    }
 

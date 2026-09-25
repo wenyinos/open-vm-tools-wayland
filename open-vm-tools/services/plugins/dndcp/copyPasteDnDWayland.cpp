@@ -281,6 +281,12 @@ CopyPasteDnDWayland::RegisterDnD()
    if (!wrapper->IsDnDRegistered()) {
       m_dndUI = new DnDUIX11(wrapper->GetToolsAppCtx());
       if (m_dndUI != NULL) {
+         /*
+          * The same block control the file paste path uses. Drag and drop
+          * stages host files through vmblock the same way copy and paste
+          * does.
+          */
+         m_dndUI->SetBlockControl(&m_blockCtrl);
          if (m_dndUI->Init()) {
             wrapper->SetDnDIsRegistered(TRUE);
             m_dndUI->SetDnDAllowed(TRUE);
@@ -418,11 +424,12 @@ CopyPasteDnDWayland::SetDnDAllowed(bool allowed)
  *
  * CopyPasteDnDWayland::GetCaps --
  *
- *    Report what this backend supports, which is copy and paste of every
- *    format the X11 backend handles.
+ *    Report what this backend supports, which is the same set the X11
+ *    backend reports, less drag and drop when GTK could not open a display.
  *
  *    Copy and paste owns the Wayland selection directly, so one selection can
- *    carry rich text and its plain rendering at once.
+ *    carry rich text and its plain rendering at once. Drag and drop is
+ *    delegated to DnDUIX11, which handles every format.
  *
  *-----------------------------------------------------------------------------
  */
@@ -431,8 +438,9 @@ uint32
 CopyPasteDnDWayland::GetCaps()
 {
    return DND_CP_CAP_VALID |
+          (m_haveGtk ? DND_CP_CAP_DND : 0) |
           DND_CP_CAP_CP |
-          DND_CP_CAP_FORMATS_CP |
+          DND_CP_CAP_FORMATS_ALL |
           DND_CP_CAP_ACTIVE_CP |
           DND_CP_CAP_BIG_BUFFER;
 }

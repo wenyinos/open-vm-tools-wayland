@@ -70,11 +70,13 @@ public:
    bool register_target_value_handler(target_drag_value_handler handler, void *ctx);
    bool EnableDND(void);
    bool DisableDND(void);
-   void UpdateDetWnd(bool Show, int32 x, int32 y);
+   void UpdateDetWnd(bool Show, int32 x, int32 y, bool asDropTarget = false);
    bool SimulateXEvents(const bool showWidget, const bool buttonEvent,
                         const bool buttonPress, const bool moveWindow,
                         const bool coordsProvided,
                         const int xCoord, const int yCoord);
+   /* Where the compositor put the window, which may not be where asked. */
+   void GetGeometry(int &x, int &y, int &width, int &height);
    void RefreshScreenSize(void);
    void StartDrag(Glib::RefPtr<Gdk::ContentProvider> provider,
                   int mouseX,
@@ -91,13 +93,17 @@ private:
    void Show();
    void Hide();
    void Raise();
+   void ApplyDetWndMode();
+   bool WaitUntilManaged(unsigned int timeoutMs);
+   void RequestSkipTaskbar();
+   bool GetXWindow(Display **display, Window *xwindow);
+   void SendWmState(long action, Atom first, Atom second, long source);
    void Lower();
    void Flush();
    int GetScreenWidth();
    int GetScreenHeight();
    void SetGeometry(const int x, const int y,
                     const int width, const int height);
-   void GetGeometry(int &x, int &y, int &width, int &height);
    void SetIsVisible(const bool isVisible) {m_isVisible = isVisible;};
    bool GetIsVisible() {return m_isVisible;};
    bool SimulateMouseMove(const int x, const int y);
@@ -107,6 +113,12 @@ private:
    Glib::RefPtr< Gtk::DragSource > mSource;
    Glib::RefPtr< Gtk::DropTarget > mTarget;
    bool mUseUInput;
+   /* The X server is Xwayland, under a Wayland compositor. */
+   bool mUnderWayland;
+   /* Where SetGeometry() last asked for the window, for the WM_NORMAL_HINTS. */
+   bool mPlaced;
+   int mPlacedX;
+   int mPlacedY;
    int mScreenWidth;
    int mScreenHeight;
 };
