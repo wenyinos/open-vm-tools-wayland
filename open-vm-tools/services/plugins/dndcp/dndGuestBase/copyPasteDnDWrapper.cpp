@@ -28,6 +28,9 @@
 
 #if defined(HAVE_GTKMM)
 #include "copyPasteDnDX11.h"
+#if defined(HAVE_WAYLAND)
+#include "copyPasteDnDWayland.h"
+#endif
 #endif
 
 #if defined(WIN32)
@@ -149,7 +152,29 @@ CopyPasteDnDWrapper::Init(ToolsAppCtx *ctx)
 
    if (!m_pimpl) {
 #if defined(HAVE_GTKMM)
+#if defined(HAVE_WAYLAND)
+      /*
+       * Use the Wayland backend in a Wayland session. The X11 backend works
+       * through X selections under Xwayland, which do not reach native
+       * Wayland applications from this windowless daemon on every
+       * compositor. The choice is made at run time so that one build serves
+       * both kinds of session. Wayland is chosen when WAYLAND_DISPLAY is set
+       * and the session is not an X11 one. A compositor started from a text
+       * console, such as sway, leaves XDG_SESSION_TYPE at "tty", and an
+       * X11 session that happens to export WAYLAND_DISPLAY says "x11".
+       */
+      if (g_getenv("WAYLAND_DISPLAY") != NULL &&
+          (g_getenv("DISPLAY") == NULL ||
+           g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "x11") != 0)) {
+         g_debug("%s: Wayland session detected, using Wayland CP backend.\n",
+                 __FUNCTION__);
+         m_pimpl = new CopyPasteDnDWayland();
+      } else {
+         m_pimpl = new CopyPasteDnDX11();
+      }
+#else
       m_pimpl = new CopyPasteDnDX11();
+#endif
 #endif
 #if defined(WIN32)
 #ifdef DND_VM

@@ -115,6 +115,8 @@ if HAVE_WAYLAND
 libdndcp_la_CPPFLAGS += @WAYLAND_CFLAGS@
 libdndcp_la_LIBADD += @WAYLAND_LIBS@
 
+libdndcp_la_SOURCES += copyPasteDnDWayland.cpp
+libdndcp_la_SOURCES += copyPasteUIWayland.cpp
 libdndcp_la_SOURCES += waylandClipboard/waylandClipboard.c
 endif
 
