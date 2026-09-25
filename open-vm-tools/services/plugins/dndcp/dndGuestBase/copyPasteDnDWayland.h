@@ -60,10 +60,14 @@ public:
    virtual void SetDnDAllowed(bool allowed);
    virtual uint32 GetCaps();
 
+   DnDBlockControl *GetBlockCtrl() { return &m_blockCtrl; }
+
 private:
    ToolsAppCtx *m_ctx;
    CopyPasteUIWayland *m_copyPasteUI;
    DnDUIX11 *m_dndUI;
+   DnDBlockControl m_blockCtrl;
+   bool m_blockInited;
 #if defined(GTK3)
    Gtk::Main *m_main;
 #endif

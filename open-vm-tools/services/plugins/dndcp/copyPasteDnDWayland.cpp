@@ -36,6 +36,7 @@
 
 extern "C" {
 #include "dndCPMsgV4.h"
+#include "vmblock.h"
 }
 
 
@@ -53,11 +54,13 @@ CopyPasteDnDWayland::CopyPasteDnDWayland()
  : m_ctx(NULL),
    m_copyPasteUI(NULL),
    m_dndUI(NULL),
+   m_blockInited(false),
 #if defined(GTK3)
    m_main(NULL),
 #endif
    m_haveGtk(false)
 {
+   memset(&m_blockCtrl, 0, sizeof m_blockCtrl);
 }
 
 
@@ -81,6 +84,10 @@ CopyPasteDnDWayland::~CopyPasteDnDWayland()
       delete m_dndUI;
       m_dndUI = NULL;
    }
+   if (m_blockInited && DnD_BlockIsReady(&m_blockCtrl)) {
+      DnD_UninitializeBlocking(&m_blockCtrl);
+      m_blockInited = false;
+   }
 #if defined(GTK3)
    delete m_main;
 #endif
@@ -93,8 +100,8 @@ CopyPasteDnDWayland::~CopyPasteDnDWayland()
  * CopyPasteDnDWayland::Init --
  *
  *    Initialize the Wayland platform DnD/CP. Pin GDK to its X11 backend for
- *    drag and drop. The copy/paste UI is created lazily in RegisterCP,
- *    mirroring the X11 backend.
+ *    drag and drop and bring up vmblock. The copy/paste UI is created lazily
+ *    in RegisterCP, mirroring the X11 backend.
  *
  *    Gtk::Application and Gtk::Main call gtk_init(), which exits the process
  *    when it cannot open a display, and a Wayland session may have no
@@ -137,6 +144,26 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
    if (!m_haveGtk) {
       g_warning("%s: cannot open an X display, drag and drop is disabled\n",
                 __FUNCTION__);
+   }
+
+   /*
+    * Bring up the vmblock subsystem. vmware-user-suid-wrapper opens
+    * VMBLOCK_FUSE_DEVICE as root and passes the descriptor as --blockFd, so
+    * the common path is CompleteBlockInitialization; InitializeBlocking is the
+    * fallback for a daemon started without the wrapper, and will fail without
+    * privilege. Host to guest file paste needs vmblock. It lets this backend
+    * publish a URI list at once and stall the reader until the bytes arrive.
+    */
+   if (!m_blockInited && ctx != NULL) {
+      memset(&m_blockCtrl, 0, sizeof m_blockCtrl);
+      m_blockCtrl.fd = ctx->blockFD;
+      m_blockCtrl.fd >= 0 ?
+         DnD_CompleteBlockInitialization(m_blockCtrl.fd, &m_blockCtrl) :
+         DnD_InitializeBlocking(&m_blockCtrl);
+      m_blockInited = true;
+      g_debug("%s: vmblock %s (fd %d)\n", __FUNCTION__,
+              DnD_BlockIsReady(&m_blockCtrl) ? "ready" : "unavailable",
+              m_blockCtrl.fd);
    }
 
    return TRUE;
@@ -186,6 +213,7 @@ CopyPasteDnDWayland::RegisterCP()
 
    m_copyPasteUI = new CopyPasteUIWayland();
    if (m_copyPasteUI) {
+      m_copyPasteUI->SetBlockControl(&m_blockCtrl);
       if (m_copyPasteUI->Init()) {
          wrapper->SetCPIsRegistered(TRUE);
          int version = wrapper->GetCPVersion();
@@ -390,8 +418,8 @@ CopyPasteDnDWayland::SetDnDAllowed(bool allowed)
  *
  * CopyPasteDnDWayland::GetCaps --
  *
- *    Report what this backend supports, which is copy and paste of text, RTF
- *    and PNG images.
+ *    Report what this backend supports, which is copy and paste of every
+ *    format the X11 backend handles.
  *
  *    Copy and paste owns the Wayland selection directly, so one selection can
  *    carry rich text and its plain rendering at once.
@@ -404,9 +432,7 @@ CopyPasteDnDWayland::GetCaps()
 {
    return DND_CP_CAP_VALID |
           DND_CP_CAP_CP |
-          DND_CP_CAP_PLAIN_TEXT_CP |
-          DND_CP_CAP_RTF_CP |
-          DND_CP_CAP_IMAGE_CP |
+          DND_CP_CAP_FORMATS_CP |
           DND_CP_CAP_ACTIVE_CP |
           DND_CP_CAP_BIG_BUFFER;
 }

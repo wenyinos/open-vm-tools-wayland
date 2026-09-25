@@ -37,26 +37,40 @@
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/poll.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <gtk/gtk.h>
 
 #include "vmware.h"
 #include "copyPasteUIWayland.h"
 #include "waylandClipboard.h"
+#include "copyPasteDnDUtil.h"
 #include "guestDnDCPMgr.hh"
+#include "dndFileList.hh"
 #include "dndMsg.h"
 
 extern "C" {
+#include "dynbuf.h"
 #include "file.h"
 #include "str.h"
 #include "util.h"
 #include "dndCPMsgV4.h"
+#include "vmblock.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 }
+
+
+/* What FileBlockMonitorThread passes to the main loop. */
+typedef struct {
+   CopyPasteUIWayland *cp;
+   unsigned int generation;
+} WaylandPasteReport;
 
 
 /*
@@ -66,6 +80,13 @@ extern "C" {
  * read have what is left of it.
  */
 #define CP_REQUEST_BUDGET_MS 2000
+
+/*
+ * KDE keeps the copy or cut distinction out of the URI list, in a target of
+ * its own that holds "1" for a cut and "0" for a copy.
+ */
+#define FCP_TARGET_NAME_KDE_CUT_SELECTION "application/x-kde-cutselection"
+#define FCP_KDE_CUT_SELECTION_COPY        "0"
 
 
 /*
@@ -725,13 +746,21 @@ CopyPasteUIWayland::CopyPasteUIWayland()
    mXReaderOpen(false),
    mSelectionGeneration(0),
    mReadGeneration(G_MAXUINT64),
-   mRetriedGeneration(G_MAXUINT64)
+   mRetriedGeneration(G_MAXUINT64),
+   mBlockCtrl(NULL),
+   mBlockAdded(false),
+   mBlockGeneration(0),
+   mThread(0),
+   mThreadStarted(false),
+   mThreadInited(false)
 {
    GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
    ASSERT(p);
    mCP = p->GetCopyPasteMgr();
    ASSERT(mCP);
    CPClipboard_Init(&mClipboard);
+   mThreadParams.mainContext = NULL;
+   mThreadParams.pendingPaste = NULL;
 }
 
 
@@ -757,7 +786,36 @@ CopyPasteUIWayland::~CopyPasteUIWayland()
       CopyPasteXReaderClose();
       mXReaderOpen = false;
    }
+
+   /*
+    * Remove the block first. The monitor thread may be blocked in a read on
+    * the notify path, and removing the block ends that read. Joining before
+    * that would wait for a paste that may never happen.
+    */
+   RemoveHGBlock();
+
+   TerminateThread();
+
+   /*
+    * Destroy any report the thread queued before the join. It would
+    * otherwise run after this object is gone.
+    */
+   if (mThreadParams.pendingPaste != NULL) {
+      g_source_destroy(mThreadParams.pendingPaste);
+      g_source_unref(mThreadParams.pendingPaste);
+      mThreadParams.pendingPaste = NULL;
+   }
+   if (mThreadParams.mainContext != NULL) {
+      g_main_context_unref(mThreadParams.mainContext);
+      mThreadParams.mainContext = NULL;
+   }
+
    WaylandClipboard_Exit();
+   if (mThreadInited) {
+      pthread_cond_destroy(&mThreadParams.fileBlockCond);
+      pthread_mutex_destroy(&mThreadParams.fileBlockMutex);
+      mThreadInited = false;
+   }
    CPClipboard_Destroy(&mClipboard);
 }
 
@@ -767,8 +825,8 @@ CopyPasteUIWayland::~CopyPasteUIWayland()
  *
  * CopyPasteUIWayland::Init --
  *
- *    Choose how to own and read the local selection and connect to the
- *    common-layer copy/paste signals.
+ *    Choose how to own and read the local selection, connect to the
+ *    common-layer copy/paste signals and start the vmblock monitor thread.
  *    The RPC transport runs on the toolbox GLib main loop.
  *
  *-----------------------------------------------------------------------------
@@ -820,6 +878,33 @@ CopyPasteUIWayland::Init()
    mCP->destRequestClipChanged.connect(
       sigc::mem_fun(this, &CopyPasteUIWayland::GetLocalClipboard));
 
+   mCP->getFilesDoneChanged.connect(
+      sigc::mem_fun(this, &CopyPasteUIWayland::GetLocalFilesDone));
+
+   /*
+    * The monitor thread lets a host to guest file paste wait until the user
+    * pastes. Start it once. It waits on its condition variable until a block
+    * is armed.
+    */
+   pthread_mutex_init(&mThreadParams.fileBlockMutex, NULL);
+   pthread_cond_init(&mThreadParams.fileBlockCond, NULL);
+   mThreadInited = true;
+   mThreadParams.fileBlockCondExit = false;
+   mThreadParams.cp = this;
+   mThreadParams.fileBlockName.clear();
+   mThreadParams.fileBlockGeneration = 0;
+   /* Init runs on the main loop, where paste reports must be dispatched. */
+   mThreadParams.mainContext = g_main_context_ref_thread_default();
+   mThreadParams.pendingPaste = NULL;
+   if (pthread_create(&mThread, NULL,
+                      CopyPasteUIWayland::FileBlockMonitorThread,
+                      &mThreadParams) == 0) {
+      mThreadStarted = true;
+   } else {
+      g_warning("%s: could not start the file block monitor thread; "
+                "host -> guest file paste will not work\n", __FUNCTION__);
+   }
+
    mInited = true;
    return true;
 }
@@ -861,6 +946,46 @@ CopyPasteUIWayland::ClearLastClipboard(void)
    mLastClipboardText.clear();
    mLastClipboardImage.clear();
    mLastClipboardRtf.clear();
+   mLastClipboardFiles.clear();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::LocalFileOfferIsLive --
+ *
+ *    Whether the files of the host clip on the selection can still be
+ *    pasted. A file list stays pasteable while its staging directory exists.
+ *    GetLocalFilesDone() forgets the directory when a transfer fails. File
+ *    contents stay pasteable while the files written out for them exist.
+ *    Those are plain files, so checking them does not wait on vmblock.
+ *
+ * Results:
+ *    true for a clip without files.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+CopyPasteUIWayland::LocalFileOfferIsLive(const CPClipboard *clip)  // IN
+{
+   if (CPClipboard_ItemExists(clip, CPFORMAT_FILELIST)) {
+      return !mHGStagingDir.empty() &&
+             g_file_test(mHGStagingDir.c_str(), G_FILE_TEST_IS_DIR);
+   }
+   if (CPClipboard_ItemExists(clip, CPFORMAT_FILECONTENTS)) {
+      if (mLastClipboardFiles.empty()) {
+         return false;
+      }
+      for (size_t i = 0; i < mLastClipboardFiles.size(); i++) {
+         if (!g_file_test(mLastClipboardFiles[i].c_str(),
+                          G_FILE_TEST_EXISTS)) {
+            return false;
+         }
+      }
+   }
+   return true;
 }
 
 
@@ -903,7 +1028,13 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
                         DynBuf_GetSize(&serialized));
       }
       DynBuf_Destroy(&serialized);
+      /*
+       * A clip with files is kept only while its files can still be pasted.
+       * Installing it again stages them anew, and that removes the files a
+       * paste in progress may still be reading.
+       */
       if (!current.empty() && current == mLastHostClip &&
+          LocalFileOfferIsLive(clip) &&
           (WaylandClipboard_IsOwner() ||
            CopyPasteXWriterIsOwner(XWriterClipboard()))) {
          g_debug("%s: the guest still offers this host clip; leaving it\n",
@@ -923,6 +1054,14 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
    ClearLastClipboard();
 
    /*
+    * Drop any block left over from a previous file clip. Without this,
+    * DnD_CreateStagingDirectory() hands back the same still-empty directory
+    * on the next file copy and AddBlock refuses it, so only the first file
+    * paste of a session would ever work.
+    */
+   RemoveHGBlock();
+
+   /*
     * Log every format the host offered. The host may attach a text rendering,
     * such as a filename or URL, to an image copy, so the order in which the
     * formats are consumed decides which one is used.
@@ -932,6 +1071,27 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
            CPClipboard_ItemExists(clip, CPFORMAT_TEXT)     ? " text"  : "",
            CPClipboard_ItemExists(clip, CPFORMAT_RTF)      ? " rtf"   : "",
            CPClipboard_ItemExists(clip, CPFORMAT_FILELIST) ? " files" : "");
+
+   /*
+    * Files first. A file selection normally also carries a text rendering of
+    * the paths, and consuming that would turn a file paste into a paste of
+    * filenames. copyPasteUIX11.cpp checks text first here, and files first
+    * only in the guest to host direction.
+    */
+   if (CPClipboard_ItemExists(clip, CPFORMAT_FILELIST) &&
+       SetRemoteFileList(clip)) {
+      return;
+   }
+
+   /*
+    * File contents rather than paths. The host sends the bytes when the
+    * source has no file on disk to point at. Write them out and publish the
+    * staged paths as for any other file list.
+    */
+   if (CPClipboard_ItemExists(clip, CPFORMAT_FILECONTENTS) &&
+       SetRemoteFileContents(clip)) {
+      return;
+   }
 
    /*
     * Offer every format the host sent in one selection, so an application
@@ -1117,8 +1277,8 @@ CopyPasteUIWayland::GetSelectionGeneration(guint64 *generation)  // OUT
  *
  * CopyPasteUIWayland::GetLocalClipboard --
  *
- *    Read the local selection and send it to the host. An image comes first,
- *    then rich text with its plain text rendering, then plain text.
+ *    Read the local selection and send it to the host. Files come first, then
+ *    an image, then rich text with its plain text rendering, then plain text.
  *    When copy and paste is allowed, every request gets one reply, with an
  *    empty or not-changed clip when there is nothing new, so that the host
  *    request does not hang.
@@ -1153,7 +1313,9 @@ CopyPasteUIWayland::GetLocalClipboard(void)
    /*
     * When this client owns the selection, the selection holds what the host
     * sent, so there is nothing new to report. Reading it back would send the
-    * host its own data. On the
+    * host its own data. For a file paste the uri-list also points into a
+    * staging directory that is still blocked, and reading it would stall
+    * this main loop and the RPC channel that lifts the block. On the
     * fallback this process owns the X selection after
     * CopyPasteXWriterOffer(). GDK answers a read of it from this main loop,
     * which the read holds, so the read would also wait out the budget.
@@ -1187,7 +1349,29 @@ CopyPasteUIWayland::GetLocalClipboard(void)
    CPClipboard_Clear(&mClipboard);
 
    /*
-    * An image first, as in copyPasteUIX11.cpp. An image selection often also
+    * Files first. A file selection also advertises a text rendering of the
+    * paths, and taking that would turn a file copy into a copy of filenames.
+    */
+   if (mCP->CheckCapability(DND_CP_CAP_FILE_CP) &&
+       (CopyPasteWaylandHasType(FCP_TARGET_NAME_URI_LIST, deadline) ||
+        CopyPasteWaylandHasType(FCP_TARGET_NAME_GNOME_COPIED_FILES,
+                                 deadline))) {
+      switch (GetLocalFileList(deadline)) {
+      case FILELIST_SET:
+         SendLocalClip();
+         return;
+      case FILELIST_UNCHANGED:
+         SendClipNotChanged();
+         return;
+      case FILELIST_UNUSABLE:
+         g_debug("%s: uri-list present but unusable, falling through\n",
+                 __FUNCTION__);
+         break;
+      }
+   }
+
+   /*
+    * Then an image, as in copyPasteUIX11.cpp. An image selection often also
     * advertises a text/plain rendering, such as a filename or a URL, and
     * reading the text would lose the image.
     */
@@ -1332,6 +1516,1166 @@ CopyPasteUIWayland::GetLocalClipboard(void)
       g_debug("%s: no text, sending empty clip back.\n", __FUNCTION__);
    }
    SendLocalClip();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteWaylandParseUriList --
+ *
+ *    Split a text/uri-list, or the x-special/gnome-copied-files rendering of
+ *    one, into unescaped paths.
+ *
+ *    The same file selection arrives spelled several ways, with CRLF or LF
+ *    line ends and with or without an operation line in front. Comparing
+ *    parsed paths rather than bytes lets this client recognise a selection
+ *    it published when it comes back in another rendering.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+CopyPasteWaylandParseUriList(const std::string &source,        // IN
+                             std::vector<std::string> &paths)  // OUT
+{
+   size_t first = source.find_first_not_of("\r\n ");
+   size_t pos = 0;
+
+   paths.clear();
+
+   while (pos < source.size()) {
+      size_t end = source.find_first_of("\r\n", pos);
+      size_t start = pos;
+      size_t index = 0;
+      size_t len = 0;
+      char *path;
+
+      if (end == std::string::npos) {
+         end = source.size();
+      }
+      pos = end + 1;
+
+      start = source.find_first_not_of(' ', start);
+      if (start == std::string::npos || start >= end) {
+         continue;
+      }
+
+      std::string line = source.substr(start, end - start);
+
+      /*
+       * Some desktops prefix the list with the intended operation. KDE
+       * signals this out of band with application/x-kde-cutselection
+       * instead. Skip the prefix so one code path serves both.
+       */
+      if (start == first && (line == "copy" || line == "cut")) {
+         continue;
+      }
+
+      /*
+       * Take each entry on its own. DnD_UriListGetNextFile() stops at the
+       * first entry it does not support, such as a trash: or recent: URI,
+       * and the entries after it would be lost. A '#' line is a comment.
+       */
+      if (line[0] == '#' ||
+          (line.compare(0, sizeof DND_URI_LIST_PRE_KDE - 1,
+                        DND_URI_LIST_PRE_KDE) != 0 &&
+           !DnD_UriIsNonFileSchemes(line.c_str()))) {
+         g_debug("%s: skipping an unsupported entry\n", __FUNCTION__);
+         continue;
+      }
+
+      path = DnD_UriListGetNextFile(line.c_str(), &index, &len);
+      if (path != NULL) {
+         /* Keep the unescaped length, because the path may contain a NUL. */
+         paths.push_back(std::string(path, len));
+         free(path);
+      }
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteWaylandNormalizePath --
+ *
+ *    Collapse repeated and trailing separators so a path can be compared
+ *    against a directory by prefix.
+ *
+ * Results:
+ *    false for a relative path or one with a "." or ".." component. File
+ *    managers do not put those on a clipboard, and resolving ".." lexically
+ *    disagrees with the kernel whenever a symlink precedes it, so such a
+ *    path is refused.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteWaylandNormalizePath(const std::string &path,  // IN
+                              std::string &out)         // OUT
+{
+   size_t i = 0;
+
+   out.clear();
+   if (path.empty() || path[0] != '/') {
+      return false;
+   }
+   while (i < path.size()) {
+      size_t end;
+
+      while (i < path.size() && path[i] == '/') {
+         i++;
+      }
+      if (i == path.size()) {
+         break;
+      }
+      end = path.find('/', i);
+      if (end == std::string::npos) {
+         end = path.size();
+      }
+
+      std::string comp = path.substr(i, end - i);
+      if (comp == "." || comp == "..") {
+         return false;
+      }
+      out += '/';
+      out += comp;
+      i = end;
+   }
+   if (out.empty()) {
+      out = "/";
+   }
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteWaylandHasControlChar --
+ *
+ *    Whether s holds an ASCII control character.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteWaylandHasControlChar(const std::string &s)  // IN
+{
+   size_t i;
+
+   for (i = 0; i < s.size(); i++) {
+      unsigned char c = (unsigned char) s[i];
+
+      if (c < 0x20 || c == 0x7f) {
+         return true;
+      }
+   }
+   return false;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteWaylandIsUnderVmblock --
+ *
+ *    Is path inside the vmblock file system?
+ *
+ *    A lookup of a blocked entry there does not return until the block is
+ *    lifted, and GetLocalFilesDone() lifts it from the main loop. A stat of
+ *    such a path from the main loop would therefore never return. The host
+ *    has no reason to pull anything under the mount, since the entries are
+ *    its own files on their way in.
+ *
+ *    /var/run is normally a symlink to /run, so both spellings are checked.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteWaylandIsUnderVmblock(const std::string &path,  // IN: normalized
+                               const char *blockRoot)    // IN/OPT
+{
+   const char *roots[] = {
+      VMBLOCK_MOUNT_POINT,
+      VMBLOCK_FUSE_MOUNT_POINT,
+      VMBLOCK_FS_ROOT,
+      VMBLOCK_FUSE_NOTIFY_ROOT,
+      blockRoot,
+   };
+   size_t i;
+
+   for (i = 0; i < G_N_ELEMENTS(roots); i++) {
+      std::string root;
+      int alias;
+
+      if (roots[i] == NULL || roots[i][0] != '/' ||
+          !CopyPasteWaylandNormalizePath(roots[i], root)) {
+         continue;
+      }
+      for (alias = 0; alias < 2; alias++) {
+         if (alias == 1) {
+            if (root.compare(0, 9, "/var/run/") != 0) {
+               break;
+            }
+            root.erase(0, 4);
+         }
+         if (path == root ||
+             (path.size() > root.size() &&
+              path.compare(0, root.size(), root) == 0 &&
+              path[root.size()] == '/')) {
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+
+/*
+ * Sizing a guest file selection for the host.
+ *
+ * The paths come from whichever client owns the selection. Sizing a
+ * directory means walking it, and "/" is a valid entry. A lookup that passes
+ * through a symlink into the vmblock mount also blocks until the main loop
+ * lifts the block. The walk therefore runs on a thread of its own, and the
+ * main loop waits for it only until the request deadline. A walk still
+ * running then is told to stop, and finishes on its own. The walk does not
+ * follow symlinks and opens nothing but directories, so a FIFO cannot stall
+ * it. The host uses the size for information only, so a partial count is
+ * sent rather than no list.
+ */
+
+#define CP_SIZE_MAX_ENTRIES 100000
+#define CP_SIZE_MAX_DEPTH   64
+
+typedef struct {
+   gint refs;
+   gint cancelled;
+   GMutex lock;
+   GCond cond;
+   bool done;
+   uint64 total;           /* Protected by lock. */
+   unsigned int entries;   /* Only touched by the walker. */
+   std::vector<std::string> paths;
+} CopyPasteSizeJob;
+
+/*
+ * At most one walk runs at a time. A walk that never finishes stops later
+ * sizing instead of adding threads.
+ */
+static gint gSizeJobsRunning = 0;
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteSizeJobUnref --
+ *
+ *    Drop one reference to job, and free it with the last one.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+CopyPasteSizeJobUnref(CopyPasteSizeJob *job)  // IN
+{
+   if (g_atomic_int_dec_and_test(&job->refs)) {
+      g_mutex_clear(&job->lock);
+      g_cond_clear(&job->cond);
+      delete job;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteSizeJobStop --
+ *
+ *    Whether the walk should stop, because the main loop gave up waiting for it
+ *    or it has visited CP_SIZE_MAX_ENTRIES entries.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteSizeJobStop(CopyPasteSizeJob *job)  // IN
+{
+   return g_atomic_int_get(&job->cancelled) ||
+          job->entries >= CP_SIZE_MAX_ENTRIES;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteSizeDir --
+ *
+ *    Add up the sizes of the regular files under a directory, down to
+ *    CP_SIZE_MAX_DEPTH levels, without following symlinks.
+ *
+ * Results:
+ *    The total in bytes. dirFd is closed.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static uint64
+CopyPasteSizeDir(CopyPasteSizeJob *job,  // IN
+                 int dirFd,              // IN: consumed
+                 unsigned int depth)     // IN
+{
+   DIR *dir = fdopendir(dirFd);
+   struct dirent *ent;
+   uint64 total = 0;
+
+   if (dir == NULL) {
+      close(dirFd);
+      return 0;
+   }
+   while (!CopyPasteSizeJobStop(job) && (ent = readdir(dir)) != NULL) {
+      struct stat st;
+
+      if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+         continue;
+      }
+      job->entries++;
+      if (fstatat(dirfd(dir), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+         continue;
+      }
+      if (S_ISREG(st.st_mode)) {
+         total += (uint64) st.st_size;
+      } else if (S_ISDIR(st.st_mode) && depth < CP_SIZE_MAX_DEPTH) {
+         int fd = openat(dirfd(dir), ent->d_name,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK |
+                         O_CLOEXEC);
+
+         if (fd >= 0) {
+            total += CopyPasteSizeDir(job, fd, depth + 1);
+         }
+      }
+   }
+   closedir(dir);
+   return total;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteSizeThread --
+ *
+ *    The thread that walks job->paths. It adds each path's size to job->total,
+ *    signals job->cond when it is done, and drops its reference to job.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static gpointer
+CopyPasteSizeThread(gpointer data)  // IN
+{
+   CopyPasteSizeJob *job = (CopyPasteSizeJob *) data;
+   size_t i;
+
+   for (i = 0; i < job->paths.size() && !CopyPasteSizeJobStop(job); i++) {
+      const char *path = job->paths[i].c_str();
+      struct stat st;
+      uint64 size = 0;
+
+      job->entries++;
+      if (fstatat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+         continue;
+      }
+      if (S_ISREG(st.st_mode)) {
+         size = (uint64) st.st_size;
+      } else if (S_ISDIR(st.st_mode)) {
+         int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK |
+                             O_CLOEXEC);
+
+         if (fd >= 0) {
+            size = CopyPasteSizeDir(job, fd, 0);
+         }
+      }
+
+      g_mutex_lock(&job->lock);
+      job->total += size;
+      g_mutex_unlock(&job->lock);
+   }
+
+   g_mutex_lock(&job->lock);
+   job->done = true;
+   g_cond_signal(&job->cond);
+   g_mutex_unlock(&job->lock);
+
+   g_atomic_int_add(&gSizeJobsRunning, -1);
+   CopyPasteSizeJobUnref(job);
+   return NULL;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteWaylandSizePaths --
+ *
+ *    Add up the sizes of paths, giving up at deadline.
+ *
+ * Results:
+ *    The total counted, which is short of the truth when the walk was cut
+ *    off or could not be started.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static uint64
+CopyPasteWaylandSizePaths(const std::vector<std::string> &paths,  // IN
+                          gint64 deadline)                        // IN
+{
+   CopyPasteSizeJob *job;
+   GThread *thread;
+   GError *err = NULL;
+   uint64 total;
+   bool done;
+
+   if (paths.empty()) {
+      return 0;
+   }
+   if (g_atomic_int_get(&gSizeJobsRunning) > 0) {
+      g_debug("%s: an earlier walk is still running, not sizing\n",
+              __FUNCTION__);
+      return 0;
+   }
+
+   job = new CopyPasteSizeJob;
+   job->refs = 2;
+   job->cancelled = 0;
+   g_mutex_init(&job->lock);
+   g_cond_init(&job->cond);
+   job->done = false;
+   job->total = 0;
+   job->entries = 0;
+   job->paths = paths;
+
+   g_atomic_int_inc(&gSizeJobsRunning);
+   thread = g_thread_try_new("dndcp-size", CopyPasteSizeThread, job, &err);
+   if (thread == NULL) {
+      g_debug("%s: could not start the walk: %s\n", __FUNCTION__,
+              err != NULL ? err->message : "unknown error");
+      g_clear_error(&err);
+      g_atomic_int_add(&gSizeJobsRunning, -1);
+      job->refs = 1;
+      CopyPasteSizeJobUnref(job);
+      return 0;
+   }
+   g_thread_unref(thread);
+
+   g_mutex_lock(&job->lock);
+   while (!job->done) {
+      if (!g_cond_wait_until(&job->cond, &job->lock, deadline)) {
+         break;
+      }
+   }
+   done = job->done;
+   total = job->total;
+   g_mutex_unlock(&job->lock);
+
+   if (!done) {
+      g_debug("%s: walk cut off at the deadline\n", __FUNCTION__);
+      g_atomic_int_set(&job->cancelled, 1);
+   }
+   CopyPasteSizeJobUnref(job);
+   return total;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::GetLocalFileList --
+ *
+ *    Turn the local text/uri-list selection into a CPFORMAT_FILELIST item for
+ *    the host. No vmblock is involved in this direction, because the host
+ *    pulls the contents itself once it has the list.
+ *
+ *    Mirrors CopyPasteUIX11::LocalGetSelectionFileList.
+ *
+ * Results:
+ *    FILELIST_SET when a file list was placed on mClipboard, FILELIST_UNCHANGED
+ *    when the selection is the one already reported to the host, and
+ *    FILELIST_UNUSABLE when there is nothing here to send. The caller sends
+ *    the reply in every case, so that exactly one reply reaches the host.
+ *
+ * Side effects:
+ *    May add an item to mClipboard.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+CopyPasteUIWayland::FileListResult
+CopyPasteUIWayland::GetLocalFileList(gint64 deadline)  // IN: monotonic, us
+{
+   gsize uriLen = 0;
+   guchar *uriData = CopyPasteWaylandGetData(FCP_TARGET_NAME_URI_LIST,
+                                             deadline, &uriLen);
+
+   if (uriData == NULL) {
+      /*
+       * A selection may offer only the rendering that carries the operation
+       * with the URIs, and no plain list. That is all some file managers put
+       * on the clipboard.
+       */
+      uriData = CopyPasteWaylandGetData(FCP_TARGET_NAME_GNOME_COPIED_FILES,
+                                        deadline, &uriLen);
+   }
+
+   if (uriData == NULL) {
+      return FILELIST_UNUSABLE;
+   }
+
+   std::vector<std::string> paths;
+
+   CopyPasteWaylandParseUriList(std::string((const char *) uriData, uriLen),
+                                paths);
+   g_free(uriData);
+   if (paths.empty()) {
+      return FILELIST_UNUSABLE;
+   }
+
+   /*
+    * Check this before touching the file system. When this is the list
+    * published for a host paste, its paths are under a block that the main
+    * loop has not lifted yet.
+    */
+   if (paths == mLastClipboardFiles) {
+      g_debug("%s: local clipboard file list is unchanged\n", __FUNCTION__);
+      return FILELIST_UNCHANGED;
+   }
+
+   DnDFileList fileList;
+   std::vector<std::string> usable;
+   uint64 totalSize = 0;
+   unsigned int count = 0;
+   const char *blockRoot = mBlockCtrl != NULL ? mBlockCtrl->blockRoot : NULL;
+   size_t i;
+
+   for (i = 0; i < paths.size(); i++) {
+      std::string path;
+
+      if (DnD_UriIsNonFileSchemes(paths[i].c_str())) {
+         /*
+          * ssh, sftp, smb, dav and ftp URIs. The X11 backend maps these to
+          * local gvfs paths with GFile. This file does not use GIO, so skip
+          * them.
+          */
+         g_debug("%s: skipping non-file uri\n", __FUNCTION__);
+         continue;
+      }
+      if (!CopyPasteWaylandNormalizePath(paths[i], path)) {
+         g_debug("%s: skipping a relative path or one with . or ..\n",
+                 __FUNCTION__);
+         continue;
+      }
+      /*
+       * The host names its copy after the last component, so the path must
+       * have one, and it must be a plain name. Unescaping can put a line
+       * break or a NUL into it.
+       */
+      if (path == "/" || CopyPasteWaylandHasControlChar(paths[i])) {
+         g_debug("%s: skipping a path with no usable name\n", __FUNCTION__);
+         continue;
+      }
+      if (CopyPasteWaylandIsUnderVmblock(path, blockRoot)) {
+         g_debug("%s: skipping %s, which is inside vmblock\n", __FUNCTION__,
+                 path.c_str());
+         continue;
+      }
+
+      const char *relPath = strrchr(path.c_str(), DIRSEPC) + 1;
+
+      fileList.AddFile(path.c_str(), relPath);
+      usable.push_back(path);
+      count++;
+   }
+
+   if (count == 0) {
+      g_debug("%s: uri list produced no usable paths\n", __FUNCTION__);
+      return FILELIST_UNUSABLE;
+   }
+   totalSize = CopyPasteWaylandSizePaths(usable, deadline);
+
+   DynBuf buf;
+   DynBuf_Init(&buf);
+   fileList.SetFileSize(totalSize);
+   fileList.ToCPClipboard(&buf, false);
+
+   bool ok = CPClipboard_SetItem(&mClipboard, CPFORMAT_FILELIST,
+                                 DynBuf_Get(&buf), DynBuf_GetSize(&buf));
+   DynBuf_Destroy(&buf);
+
+   if (!ok) {
+      g_warning("%s: could not set the file list item\n", __FUNCTION__);
+      return FILELIST_UNUSABLE;
+   }
+
+   g_debug("%s: sending %u file(s), %" FMT64 "u bytes total\n",
+           __FUNCTION__, count, totalSize);
+
+   ClearLastClipboard();
+   mLastClipboardFiles = paths;
+   return FILELIST_SET;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::FileBlockMonitorThread --
+ *
+ *    Wait for the user to paste. After SetRemoteFileList() publishes a URI
+ *    list pointing into the vmblock file system, nothing has been transferred
+ *    yet. When the pasting application opens one of those paths,
+ *    vmblock-fuse stalls its open(2) and the read(2) here returns. The main
+ *    loop then asks the host for the bytes. A host-side copy of a large file
+ *    therefore costs nothing until it is pasted.
+ *
+ *    Ported from CopyPasteUIX11::FileBlockMonitorThread.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void *
+CopyPasteUIWayland::FileBlockMonitorThread(void *arg)  // IN
+{
+   WaylandThreadParams *params = (WaylandThreadParams *) arg;
+
+   pthread_mutex_lock(&params->fileBlockMutex);
+   while (!params->fileBlockCondExit) {
+      /*
+       * Test the predicate before waiting and again after every wake.
+       * TerminateThread() can signal while this thread is in the read below
+       * rather than on the condition variable. A wait entered without this
+       * check would miss that signal, and the join would never return.
+       */
+      if (params->fileBlockName.empty()) {
+         g_debug("%s: waiting for a block to monitor\n", __FUNCTION__);
+         pthread_cond_wait(&params->fileBlockCond, &params->fileBlockMutex);
+         continue;
+      }
+
+      /*
+       * The read below blocks until the block is touched or lifted, which may
+       * be never. Take a copy of the path and drop the mutex first, or
+       * TerminateThread() cannot acquire it to ask this thread to exit.
+       */
+      std::string blockName = params->fileBlockName;
+      unsigned int generation = params->fileBlockGeneration;
+
+      /*
+       * Consume the request. The path is armed for this pass only, so a wake
+       * with no new block sends the thread back to waiting rather than
+       * reopening the path just handled.
+       */
+      params->fileBlockName.clear();
+      pthread_mutex_unlock(&params->fileBlockMutex);
+
+      int fd = open(blockName.c_str(), O_RDONLY);
+      if (fd < 0) {
+         g_debug("%s: failed to open %s: %s\n", __FUNCTION__,
+                 blockName.c_str(), g_strerror(errno));
+         pthread_mutex_lock(&params->fileBlockMutex);
+         continue;
+      }
+
+      char buf[sizeof(VMBLOCK_FUSE_READ_RESPONSE)];
+      ssize_t size = read(fd, buf, sizeof buf);
+
+      /*
+       * The read above blocks until another process touches the blocked path
+       * or the block is lifted. The content of the response does not matter.
+       */
+      g_debug("%s: notify read returned %" FMTSZ "d\n", __FUNCTION__, size);
+
+      close(fd);
+
+      /*
+       * Lock before checking the exit flag. The destructor removes the block,
+       * which ends the read, and only then asks this thread to exit, so the
+       * request can arrive at any point above.
+       */
+      pthread_mutex_lock(&params->fileBlockMutex);
+      if (params->fileBlockCondExit) {
+         break;
+      }
+
+      /*
+       * Report to the main loop, with the generation of the block this read
+       * was for. The block may have been lifted or replaced by the time the
+       * report is dispatched. This report replaces any earlier one that has
+       * not been dispatched.
+       */
+      WaylandPasteReport *report = g_new(WaylandPasteReport, 1);
+      report->cp = params->cp;
+      report->generation = generation;
+
+      if (params->pendingPaste != NULL) {
+         g_source_destroy(params->pendingPaste);
+         g_source_unref(params->pendingPaste);
+      }
+      params->pendingPaste = g_idle_source_new();
+      g_source_set_callback(params->pendingPaste,
+                            CopyPasteUIWayland::PasteObserved, report,
+                            g_free);
+      g_source_attach(params->pendingPaste, params->mainContext);
+   }
+   pthread_mutex_unlock(&params->fileBlockMutex);
+   return NULL;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::PasteObserved --
+ *
+ *    The main loop part of FileBlockMonitorThread(). A reader touched a
+ *    blocked path, so ask the host for the files if the block the thread was
+ *    watching is still in place.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+CopyPasteUIWayland::PasteObserved(gpointer data)  // IN: WaylandPasteReport
+{
+   WaylandPasteReport *report = (WaylandPasteReport *) data;
+   CopyPasteUIWayland *cp = report->cp;
+
+   pthread_mutex_lock(&cp->mThreadParams.fileBlockMutex);
+   if (cp->mThreadParams.pendingPaste == g_main_current_source()) {
+      g_source_unref(cp->mThreadParams.pendingPaste);
+      cp->mThreadParams.pendingPaste = NULL;
+   }
+   pthread_mutex_unlock(&cp->mThreadParams.fileBlockMutex);
+
+   if (report->generation == cp->mBlockGeneration && cp->mBlockAdded) {
+      g_debug("%s: paste observed, requesting files\n", __FUNCTION__);
+      cp->RequestFiles();
+   } else {
+      g_debug("%s: block already removed or replaced, nothing to request\n",
+              __FUNCTION__);
+   }
+   return G_SOURCE_REMOVE;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::TerminateThread --
+ *
+ *    Signal the monitor thread to exit and join it.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::TerminateThread(void)
+{
+   if (!mThreadStarted) {
+      return;
+   }
+   pthread_mutex_lock(&mThreadParams.fileBlockMutex);
+   mThreadParams.fileBlockCondExit = true;
+   pthread_cond_signal(&mThreadParams.fileBlockCond);
+   pthread_mutex_unlock(&mThreadParams.fileBlockMutex);
+   pthread_join(mThread, NULL);
+   mThreadStarted = false;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteWaylandPathToUri --
+ *
+ *    Turn an absolute path into a file:// URI for a uri-list.
+ *
+ *    Escape every byte a receiver would read as syntax. Otherwise CR or LF
+ *    ends the entry, # or ? cuts the path short, and a literal "%2E%2E"
+ *    decodes to "..". The set is the one CopyPasteUIX11::GetNextPath()
+ *    escapes, plus the other control characters and space, which a URI may
+ *    not contain unescaped.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static std::string
+CopyPasteWaylandPathToUri(const std::string &path)  // IN
+{
+   static const char Dec2Hex[] = {
+      '0', '1', '2', '3', '4', '5', '6', '7',
+      '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
+   };
+   std::string uri = DND_URI_LIST_PRE;
+   size_t i;
+
+   for (i = 0; i < path.size(); i++) {
+      unsigned char ubyte = (unsigned char) path[i];
+
+      if (ubyte == '#' ||   /* Fragment identifier delimiter */
+          ubyte == '?' ||   /* Query string delimiter */
+          ubyte == '*' ||   /* Special significance in some schemes */
+          ubyte == '!' ||   /* Special significance in some schemes */
+          ubyte == '%' ||   /* Escape character */
+          ubyte == ' ' ||   /* Not allowed in a URI */
+          ubyte < 0x20 ||   /* Controls, including CR and LF */
+          ubyte == 0x7f ||
+          ubyte >= 0x80) {  /* UTF-8 encoding bytes */
+         uri += '%';
+         uri += Dec2Hex[ubyte >> 4];
+         uri += Dec2Hex[ubyte & 0xF];
+      } else {
+         uri += (char) ubyte;
+      }
+   }
+   return uri;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteWaylandOfferFileList --
+ *
+ *    Publish file URIs as a local clipboard selection, on the X selection
+ *    through xClipboard when it is not NULL and the protocol is absent.
+ *    Return in published the rendering that a later read of the selection
+ *    yields. The caller caches it to recognise its own selection.
+ *
+ *    A text/uri-list on its own is not enough. Thunar leaves Paste greyed out
+ *    for a selection that offers only that, however the URIs are spelled,
+ *    because the selection does not say whether it is a copy or a cut. GNOME
+ *    puts a "copy" or "cut" line ahead of the URIs. KDE puts it in a target
+ *    of its own. Offer all three renderings, and each application takes the
+ *    one it understands.
+ *
+ *    The URIs carry the file:// authority. A file manager may reject the
+ *    spelling without it, and file managers put "file:///path" on their own
+ *    clipboards, not "file:/path".
+ *
+ *    Neither GDK nor the data control code opens the paths while serving
+ *    the list. They may be under a vmblock block that the main loop lifts.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static bool
+CopyPasteWaylandOfferFileList(const std::vector<std::string> &uris,  // IN
+                              gpointer xClipboard,                   // IN/OPT
+                              std::string &published)                // OUT
+{
+   std::string plainList;
+   std::string gnomeList = "copy\n";
+
+   published.clear();
+   for (size_t i = 0; i < uris.size(); i++) {
+      published += uris[i];
+      published += DND_URI_LIST_POST;
+      if (i > 0) {
+         plainList += "\n";
+      }
+      plainList += uris[i];
+   }
+   gnomeList += plainList;
+
+   WaylandClipItem items[3];
+
+   items[0].mimeType = FCP_TARGET_NAME_URI_LIST;
+   items[0].data = published.c_str();
+   items[0].size = published.size();
+   items[1].mimeType = FCP_TARGET_NAME_GNOME_COPIED_FILES;
+   items[1].data = gnomeList.c_str();
+   items[1].size = gnomeList.size();
+   items[2].mimeType = FCP_TARGET_NAME_KDE_CUT_SELECTION;
+   items[2].data = FCP_KDE_CUT_SELECTION_COPY;
+   items[2].size = sizeof FCP_KDE_CUT_SELECTION_COPY - 1;
+
+   if (WaylandClipboard_IsAvailable()) {
+      return WaylandClipboard_Offer(items, G_N_ELEMENTS(items));
+   }
+   return xClipboard != NULL &&
+          CopyPasteXWriterOffer(xClipboard, items, G_N_ELEMENTS(items));
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::RemoveHGBlock --
+ *
+ *    Lift the block on the staging directory, if one is in place. A block
+ *    left behind by a paste that was never published stalls anything that
+ *    looks at the directory, and makes the next AddBlock on it fail.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::RemoveHGBlock(void)
+{
+   if (!mBlockAdded) {
+      return;
+   }
+   mBlockAdded = false;
+   if (mBlockCtrl != NULL && DnD_BlockIsReady(mBlockCtrl)) {
+      g_debug("%s: removing block for %s\n", __FUNCTION__,
+              mHGStagingDir.c_str());
+      mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::SetRemoteFileList --
+ *
+ *    The host sent a file list. Publish a text/uri-list pointing into the
+ *    vmblock file system, so that the paste completes at once and the
+ *    transfer waits until an application reads the files.
+ *
+ *    Returns true when a URI list was installed on the local clipboard.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+CopyPasteUIWayland::SetRemoteFileList(const CPClipboard *clip)  // IN
+{
+   void *buf = NULL;
+   size_t sz = 0;
+
+   if (!CPClipboard_GetItem(clip, CPFORMAT_FILELIST, &buf, &sz) ||
+       buf == NULL || sz == 0) {
+      return false;
+   }
+
+   if (mBlockCtrl == NULL || !DnD_BlockIsReady(mBlockCtrl)) {
+      /*
+       * Without vmblock nothing can make a reader wait until the data
+       * arrives. Copying every host file selection into the guest up front
+       * would cost more than not supporting the paste, so decline.
+       */
+      g_warning("%s: vmblock is not available, skipping file paste. "
+                "Check that run-vmblock\\x2dfuse.mount is active and that "
+                "vmtoolsd -n vmusr was started with --blockFd.\n",
+                __FUNCTION__);
+      return false;
+   }
+
+   DnDFileList flist;
+   if (!flist.FromCPClipboard(buf, sz)) {
+      g_warning("%s: could not decode the host file list\n", __FUNCTION__);
+      return false;
+   }
+
+   /* A run of NUL-delimited relative paths. */
+   std::string relPaths = flist.GetRelPathsStr();
+   if (relPaths.empty()) {
+      g_warning("%s: host file list carries no paths\n", __FUNCTION__);
+      return false;
+   }
+
+   char *stagingDir = DnD_CreateStagingDirectory();
+   if (stagingDir == NULL) {
+      g_warning("%s: could not create a staging directory\n", __FUNCTION__);
+      return false;
+   }
+   mHGStagingDir = stagingDir;
+   free(stagingDir);
+
+   mBlockAdded = mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
+   if (!mBlockAdded) {
+      /*
+       * A block from an abandoned transfer may still be on this directory;
+       * the staging directory is reused whenever it is still empty. Drop it
+       * and retry once before giving up.
+       */
+      g_debug("%s: AddBlock failed for %s, retrying after RemoveBlock\n",
+              __FUNCTION__, mHGStagingDir.c_str());
+      mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
+      mBlockAdded = mBlockCtrl->AddBlock(mBlockCtrl->fd,
+                                         mHGStagingDir.c_str());
+   }
+
+   if (!mBlockAdded) {
+      g_warning("%s: failed to add a block for %s\n", __FUNCTION__,
+                mHGStagingDir.c_str());
+      return false;
+   }
+   g_debug("%s: added block for %s\n", __FUNCTION__, mHGStagingDir.c_str());
+
+   /* The last path component names the staging directory in the block root. */
+   std::string stagingName = mHGStagingDir;
+   while (!stagingName.empty() && stagingName[stagingName.size() - 1] == '/') {
+      stagingName.erase(stagingName.size() - 1);
+   }
+   size_t slash = stagingName.rfind('/');
+   if (slash != std::string::npos) {
+      stagingName = stagingName.substr(slash + 1);
+   }
+
+   /* The URIs point under the vmblock root. */
+   std::vector<std::string> uris;
+   size_t off = 0;
+   while (off < relPaths.size()) {
+      std::string name(relPaths.c_str() + off);
+
+      if (name.empty()) {
+         break;
+      }
+      off += name.size() + 1;
+
+      /*
+       * The host chooses these names. A ".." component or an absolute path
+       * would point the URI outside the staging directory, where the block
+       * does not apply.
+       */
+      if (!LocalIsSafeStagingName(name.c_str(), name.size() + 1)) {
+         g_warning("%s: rejecting an unsafe file list entry\n",
+                   __FUNCTION__);
+         RemoveHGBlock();
+         return false;
+      }
+
+      uris.push_back(CopyPasteWaylandPathToUri(
+         std::string(mBlockCtrl->blockRoot) + "/" + stagingName + "/" + name));
+   }
+
+   if (uris.empty()) {
+      g_warning("%s: built an empty URI list\n", __FUNCTION__);
+      RemoveHGBlock();
+      return false;
+   }
+
+   /* Arm the monitor before publishing, so that it sees the first paste. */
+   mBlockGeneration++;
+   pthread_mutex_lock(&mThreadParams.fileBlockMutex);
+   mThreadParams.fileBlockCondExit = false;
+   mThreadParams.fileBlockName = std::string(VMBLOCK_FUSE_NOTIFY_ROOT) + "/" +
+                                 stagingName;
+   mThreadParams.fileBlockGeneration = mBlockGeneration;
+   pthread_cond_signal(&mThreadParams.fileBlockCond);
+   pthread_mutex_unlock(&mThreadParams.fileBlockMutex);
+
+   g_debug("%s: publishing %d file URI(s)\n", __FUNCTION__, (int) uris.size());
+
+   std::string uriList;
+   if (!CopyPasteWaylandOfferFileList(uris, XWriterClipboard(), uriList)) {
+      g_warning("%s: could not install the URI list\n", __FUNCTION__);
+      pthread_mutex_lock(&mThreadParams.fileBlockMutex);
+      mThreadParams.fileBlockName.clear();
+      pthread_mutex_unlock(&mThreadParams.fileBlockMutex);
+      RemoveHGBlock();
+      return false;
+   }
+
+   /*
+    * Remember the list just published. With a stale cache the next host
+    * request would take this uri-list for a new guest copy and size every
+    * path in it. Those paths are under a block that only the main loop lifts,
+    * and the sizing would stall the main loop.
+    */
+   CopyPasteWaylandParseUriList(uriList, mLastClipboardFiles);
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::SetRemoteFileContents --
+ *
+ *    Handle a host clipboard that carries file contents instead of paths.
+ *    LocalPrepareFileContents() writes the bytes into a staging directory,
+ *    records it as the one the clipboard offers, and returns the paths it
+ *    created, which are published as a uri-list.
+ *
+ *    No vmblock is involved. Unlike a file list, the data has already
+ *    arrived, so no reader has to wait for it.
+ *
+ * Results:
+ *    true if a selection was installed.
+ *
+ * Side effects:
+ *    Writes files into the staging directory and takes the local selection.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+CopyPasteUIWayland::SetRemoteFileContents(const CPClipboard *clip)  // IN
+{
+   std::vector<utf::string> paths;
+   std::vector<std::string> uris;
+   std::string uriList;
+
+   if (!mCP->CheckCapability(DND_CP_CAP_FILE_CONTENT_CP)) {
+      g_debug("%s: file contents copy/paste not in caps\n", __FUNCTION__);
+      return false;
+   }
+   if (!LocalPrepareFileContents(clip, paths) || paths.empty()) {
+      g_debug("%s: could not write the file contents out\n", __FUNCTION__);
+      return false;
+   }
+
+   for (size_t i = 0; i < paths.size(); i++) {
+      uris.push_back(CopyPasteWaylandPathToUri(paths[i].c_str()));
+   }
+
+   g_debug("%s: staged %d file(s) from contents\n", __FUNCTION__,
+           (int) paths.size());
+
+   if (!CopyPasteWaylandOfferFileList(uris, XWriterClipboard(), uriList)) {
+      g_warning("%s: could not install the staged file list\n", __FUNCTION__);
+      return false;
+   }
+   CopyPasteWaylandParseUriList(uriList, mLastClipboardFiles);
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::GetLocalFilesDone --
+ *
+ *    The host finished or abandoned the requested transfer. Lift the block so
+ *    that the stalled reader continues.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
+{
+   g_debug("%s: success %d\n", __FUNCTION__, success);
+
+   RemoveHGBlock();
+
+   if (success) {
+      /*
+       * Ask for the staging dir to be deleted on next reboot, as the X11
+       * backends do. On POSIX, File_UnlinkDelayed() unlinks at once and
+       * fails on a directory, so this removes nothing.
+       */
+      DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
+   } else {
+      mHGStagingDir.clear();
+   }
 }
 
 
