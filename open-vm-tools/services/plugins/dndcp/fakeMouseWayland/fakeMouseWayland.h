@@ -33,5 +33,6 @@ void FakeMouse_Destory();
 bool FakeMouse_Move(int x, int y);
 bool FakeMouse_Button(bool down);
 bool FakeMouse_Click(bool down);
+bool FakeMouse_Escape(void);
 
 #endif // __FAKE_MOUSE_WAYLAND_H__

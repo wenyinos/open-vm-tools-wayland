@@ -81,6 +81,16 @@ private:
    void AddBlock();
    void RemoveBlock();
    bool LocalWaylandDragPreferred(void);
+   void LocalXdndChoosePath(void);
+   bool LocalMutterBridgesXdnd(void);
+   void LocalXdndLeaveDetWnd(void);
+   static gboolean OnXdndBeginTimeout(gpointer ctx);
+   void LocalXdndRelease(void);
+   void LocalXdndForget(void);
+   void LocalXdndRestoreDetWnd(void);
+   bool LocalXdndIsStaleDrag(GdkDrag *drag);
+   static gboolean OnXdndReleaseTick(gpointer ctx);
+   static gboolean OnGHDropCheck(gpointer ctx);
    bool StageFilePlaceholders(const DnDFileList &fList);
    void ClearFilePlaceholders(void);
    void AddBlockForDrop(void);
@@ -247,6 +257,29 @@ private:
    bool mHGDragStarted;
    /* A faked press is outstanding; it must not outlive the drag. */
    bool mHGButtonDown;
+   /*
+    * The XDND drag was pressed on the detection window and the pointer stays
+    * there until GTK has started the drag. See LocalXdndLeaveDetWnd().
+    */
+   bool mHGXdndWaitBegin;
+   guint mHGXdndBeginTimer;
+   gint64 mHGXdndBeginDeadline;
+   int mHGXdndPressX;
+   int mHGXdndPressY;
+   int mHGXdndStep;
+   /* Host motions on which the press could not be placed; see OnMoveMouse(). */
+   int mHGXdndPressRounds;
+   /* The GTK drag, for the target's answer at the drop. */
+   GdkDrag *mHGXdndDrag;
+   guint mHGXdndReleaseTimer;
+   gint64 mHGXdndLeaveAt;
+   gint64 mHGXdndLeftAt;
+   gint64 mHGXdndDropAt;
+   int mHGXdndReleaseTicks;
+   /* See OnGHDropCheck(). */
+   guint mGHDropCheckTimer;
+   /* See LocalXdndChoosePath(). */
+   bool mMutterBridgesXdnd;
    /* A native Wayland drag is running, so the XDND teardown must not run. */
    bool mWaylandDragActive;
    /* Which native drag is current; a done() for any other is ignored. */

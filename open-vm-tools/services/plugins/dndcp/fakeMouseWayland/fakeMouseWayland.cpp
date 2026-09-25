@@ -147,6 +147,10 @@ FakeMouse_Init(int fd,       // fd for uinput
       g_debug("%s: Failed to register UI_SET_KEYBIT BTN_LEFT\n", __FUNCTION__);
       goto exit;
    }
+   /* For FakeMouse_Escape(). The pointer works without it. */
+   if (ioctl(uinput_fd, UI_SET_KEYBIT, KEY_ESC) < 0) {
+      g_debug("%s: Failed to register UI_SET_KEYBIT KEY_ESC\n", __FUNCTION__);
+   }
 
    /*
     * Without an INPUT_PROP_* bit, udev and libinput cannot tell what kind of
@@ -367,6 +371,60 @@ FakeMouse_Button(bool down)  // IN
       retValue = false;
    }
 
+   return retValue;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * FakeMouse_Escape --
+ *
+ *      Press and release Escape, which cancels a drag in progress.
+ *
+ *      A compositor ends a drag when the button is released, but it counts
+ *      the button as down while any device holds it. Once a drag started with
+ *      another mouse, a release from this device changes nothing, and Escape
+ *      is the only way left to end the drag.
+ *
+ * Results:
+ *      True if success.
+ *
+ * Side effects:
+ *      Keyboard events.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+FakeMouse_Escape(void)
+{
+   if (!FakeMouse_IsInit()) {
+      return false;
+   }
+
+   bool retValue = true;
+   struct input_event event;
+
+   for (int down = 1; down >= 0; down--) {
+      memset(&event, 0, sizeof event);
+      gettimeofday(&event.time, NULL);
+      event.type = EV_KEY;
+      event.code = KEY_ESC;
+      event.value = down;
+      if (write(uinput_fd, &event, sizeof(event)) < 0) {
+         retValue = false;
+      }
+      event.type = EV_SYN;
+      event.code = SYN_REPORT;
+      event.value = 0;
+      if (write(uinput_fd, &event, sizeof(event)) < 0) {
+         retValue = false;
+      }
+   }
+   if (!retValue) {
+      g_debug("%s: Failed to write\n", __FUNCTION__);
+   }
    return retValue;
 }
 

@@ -70,7 +70,8 @@ public:
    bool register_target_value_handler(target_drag_value_handler handler, void *ctx);
    bool EnableDND(void);
    bool DisableDND(void);
-   void UpdateDetWnd(bool Show, int32 x, int32 y, bool asDropTarget = false);
+   void UpdateDetWnd(bool Show, int32 x, int32 y, bool asDropTarget = false,
+                     bool above = false);
    bool SimulateXEvents(const bool showWidget, const bool buttonEvent,
                         const bool buttonPress, const bool moveWindow,
                         const bool coordsProvided,
@@ -78,6 +79,25 @@ public:
    /* Where the compositor put the window, which may not be where asked. */
    void GetGeometry(int &x, int &y, int &width, int &height);
    void RefreshScreenSize(void);
+   /*
+    * Whether SimulateXEvents() also warps the X pointer after a uinput move.
+    * The warp is on by default. SimulateXEvents() explains when it is not.
+    */
+   void SetWarpXPointer(bool warp) { mWarpXPointer = warp; }
+   void SetAbove(bool above);
+   /* Whether the X window manager is Mutter; wmName gets its _NET_WM_NAME. */
+   bool WmIsMutter(std::string &wmName);
+   /*
+    * Whether the X server has the pointer at (x, y), within a pixel, and
+    * over the detection window.
+    */
+   bool PointerIsOver(int x, int y);
+   /*
+    * Whether the drag that last entered the window has dropped on it. GTK
+    * keeps the drop until it has read the value, so Get_Current_Drop_ctx()
+    * alone cannot tell a running drag from one that has just dropped.
+    */
+   bool XdndDropped(void) { return mXdndDropped; }
    void StartDrag(Glib::RefPtr<Gdk::ContentProvider> provider,
                   int mouseX,
                   int mouseY);
@@ -95,9 +115,13 @@ private:
    void Raise();
    void ApplyDetWndMode();
    bool WaitUntilManaged(unsigned int timeoutMs);
+   static gboolean OnDropTargetNudge(gpointer data);
+   void CancelDropTargetNudges(void);
    void RequestSkipTaskbar();
    bool GetXWindow(Display **display, Window *xwindow);
    void SendWmState(long action, Atom first, Atom second, long source);
+   static gboolean OnXEvent(GdkX11Display *display, const XEvent *xevent,
+                            gpointer data);
    void Lower();
    void Flush();
    int GetScreenWidth();
@@ -115,12 +139,23 @@ private:
    bool mUseUInput;
    /* The X server is Xwayland, under a Wayland compositor. */
    bool mUnderWayland;
+   bool mWarpXPointer;
+   bool mAbove;
+   guint mNudgeTimer;
+   int mNudgeX;
+   int mNudgeY;
+   int mNudgesLeft;
    /* Where SetGeometry() last asked for the window, for the WM_NORMAL_HINTS. */
    bool mPlaced;
    int mPlacedX;
    int mPlacedY;
    int mScreenWidth;
    int mScreenHeight;
+   /* The "xevent" handler that sets mXdndDropped, and its atoms. */
+   gulong mXEventHandler;
+   Atom mXdndEnter;
+   Atom mXdndDrop;
+   bool mXdndDropped;
 };
 
 #endif // DRAG_DET_WND_H

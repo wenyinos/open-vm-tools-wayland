@@ -40,6 +40,10 @@ extern "C" {
 #include <string.h>
 }
 
+/* See DragDetWnd::OnDropTargetNudge(). */
+#define DROP_TARGET_NUDGES    3
+#define DROP_TARGET_NUDGE_MS  100
+
 /* How long UpdateDetWnd() waits for the window manager to adopt the window. */
 #define DET_WND_MANAGE_TIMEOUT_MS 500
 
@@ -88,12 +92,23 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
      mTarget(NULL),
      mUseUInput(false),
      mUnderWayland(DetWndUnderWayland()),
+     mWarpXPointer(true),
+     mAbove(false),
+     mNudgeTimer(0),
+     mNudgeX(0),
+     mNudgeY(0),
+     mNudgesLeft(0),
      mPlaced(false),
      mPlacedX(0),
      mPlacedY(0),
      mScreenWidth(0),
-     mScreenHeight(0)
+     mScreenHeight(0),
+     mXEventHandler(0),
+     mXdndEnter(None),
+     mXdndDrop(None),
+     mXdndDropped(false)
 {
+   GdkDisplay *gdkDisplay = gdk_display_get_default();
    std::vector<GType> types;
    mWnd = new Gtk::Window();
    if (!mWnd) {
@@ -162,6 +177,12 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
     */
    mTarget->set_preload(false);
 
+   /* See OnXEvent(). */
+   if (gdkDisplay != NULL && GDK_IS_X11_DISPLAY(gdkDisplay)) {
+      mXEventHandler = g_signal_connect(gdkDisplay, "xevent",
+                                        G_CALLBACK(OnXEvent), this);
+   }
+
 /* Need to check USE_UINPUT, as FreeBSD does not support this */
 #ifdef USE_UINPUT
    // Uinput simulation for wayland backend.
@@ -206,6 +227,13 @@ fail:
 
 DragDetWnd::~DragDetWnd()
 {
+   GdkDisplay *gdkDisplay = gdk_display_get_default();
+
+   if (mXEventHandler != 0 && gdkDisplay != NULL) {
+      g_signal_handler_disconnect(gdkDisplay, mXEventHandler);
+      mXEventHandler = 0;
+   }
+   CancelDropTargetNudges();
 #ifdef USE_UINPUT
    if (mUseUInput) {
       FakeMouse_Destory();
@@ -846,7 +874,8 @@ DetWndIsManaged(Display *display,  // IN
  *    the pointer moves. In a guest to host drag the first motion is the move
  *    that UpdateDetWnd() makes through SimulateXEvents() after this returns,
  *    and on KWin a move before the window is ready loses the drag for its
- *    whole duration.
+ *    whole duration. OnDropTargetNudge() repeats the move from the main
+ *    loop.
  *
  * Results:
  *    True if the window is managed, false if timeoutMs passed first.
@@ -909,6 +938,50 @@ DragDetWnd::WaitUntilManaged(unsigned int timeoutMs)  // IN
 /*
  *-----------------------------------------------------------------------------
  *
+ * DragDetWnd::PointerIsOver --
+ *
+ *    Check whether the X server has the pointer at (x, y), within a pixel,
+ *    and over the detection window.
+ *
+ * Results:
+ *    True if both hold.
+ *
+ * Side effects:
+ *    Round trip to the X server.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DragDetWnd::PointerIsOver(int x,   // IN
+                          int y)   // IN
+{
+   Display *display;
+   Window xwindow;
+   Window retRoot, retChild;
+   int rootX, rootY, winX, winY;
+   unsigned int mask;
+
+   if (!GetXWindow(&display, &xwindow)) {
+      return false;
+   }
+
+   /*
+    * The X server learns where the pointer is only while it is over an X
+    * window, and otherwise goes on reporting the last place it saw it. So
+    * the position has to match as well as the window.
+    */
+   XSync(display, False);
+   return XQueryPointer(display, DefaultRootWindow(display), &retRoot,
+                        &retChild, &rootX, &rootY, &winX, &winY, &mask) &&
+          retChild == xwindow &&
+          ABS(rootX - x) <= 1 && ABS(rootY - y) <= 1;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * DragDetWnd::GetXWindow --
  *
  *    Look up the X display and the X window of the detection window.
@@ -936,6 +1009,107 @@ DragDetWnd::GetXWindow(Display **display,  // OUT
    *display = gdk_x11_display_get_xdisplay(gdk_surface_get_display(surface));
    *xwindow = gdk_x11_surface_get_xid(surface);
    return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DragDetWnd::WmIsMutter --
+ *
+ *    Whether the X window manager is Mutter, found the EWMH way. The root
+ *    window's _NET_SUPPORTING_WM_CHECK names a window of the window manager,
+ *    which carries the same property pointing to itself and the manager's
+ *    name in _NET_WM_NAME. Mutter sets that name from its context, which
+ *    GNOME Shell creates as "GNOME Shell" and the mutter binary as "Mutter".
+ *
+ *    This reads the X server each time, three round trips, because the
+ *    window manager can be replaced while the plugin runs.
+ *
+ * Results:
+ *    True if the name contains "GNOME Shell" or "Mutter", in any case.
+ *    wmName is set to the name, or left empty if there is none.
+ *
+ * Side effects:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DragDetWnd::WmIsMutter(std::string &wmName)   // OUT
+{
+   GdkDisplay *gdkDisplay = gtk_widget_get_display(GetWnd()->gobj());
+   Display *display;
+   Atom check;
+   Atom actualType;
+   int actualFormat;
+   unsigned long nItems;
+   unsigned long bytesAfter;
+   unsigned char *data;
+   Window wmWindow = None;
+   Window self = None;
+   bool isMutter = false;
+
+   wmName.clear();
+   if (gdkDisplay == NULL || !GDK_IS_X11_DISPLAY(gdkDisplay)) {
+      return false;
+   }
+   display = gdk_x11_display_get_xdisplay(gdkDisplay);
+   check = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
+
+   data = NULL;
+   if (XGetWindowProperty(display, DefaultRootWindow(display), check, 0, 1,
+                          False, XA_WINDOW, &actualType, &actualFormat,
+                          &nItems, &bytesAfter, &data) == Success &&
+       actualType == XA_WINDOW && actualFormat == 32 && nItems == 1) {
+      wmWindow = *(Window *)data;
+   }
+   if (data != NULL) {
+      XFree(data);
+   }
+   if (wmWindow == None) {
+      return false;
+   }
+
+   /*
+    * A window manager that has exited leaves the root property behind, and
+    * its window is then gone or reused, so check that it points to itself.
+    */
+   gdk_x11_display_error_trap_push(gdkDisplay);
+   data = NULL;
+   if (XGetWindowProperty(display, wmWindow, check, 0, 1, False, XA_WINDOW,
+                          &actualType, &actualFormat, &nItems, &bytesAfter,
+                          &data) == Success &&
+       actualType == XA_WINDOW && actualFormat == 32 && nItems == 1) {
+      self = *(Window *)data;
+   }
+   if (data != NULL) {
+      XFree(data);
+   }
+   data = NULL;
+   if (self == wmWindow &&
+       XGetWindowProperty(display, wmWindow,
+                          XInternAtom(display, "_NET_WM_NAME", False), 0, 64,
+                          False, XInternAtom(display, "UTF8_STRING", False),
+                          &actualType, &actualFormat, &nItems, &bytesAfter,
+                          &data) == Success &&
+       actualFormat == 8 && data != NULL) {
+      wmName.assign((const char *)data, nItems);
+   }
+   if (data != NULL) {
+      XFree(data);
+   }
+   gdk_x11_display_error_trap_pop_ignored(gdkDisplay);
+
+   if (!wmName.empty()) {
+      char *folded = g_utf8_casefold(wmName.c_str(), -1);
+
+      isMutter = strstr(folded, "gnome shell") != NULL ||
+                 strstr(folded, "mutter") != NULL;
+      g_free(folded);
+   }
+   return isMutter;
 }
 
 
@@ -982,6 +1156,45 @@ DragDetWnd::SendWmState(long action,   // IN: 1 to add, 0 to remove
    XSendEvent(display, DefaultRootWindow(display), False,
               SubstructureNotifyMask | SubstructureRedirectMask, &ev);
    XFlush(display);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DragDetWnd::SetAbove --
+ *
+ *    Ask the window manager to keep the detection window above other
+ *    windows, or to stop doing so.
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    Sends a _NET_WM_STATE client message to the root window.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DragDetWnd::SetAbove(bool above)   // IN
+{
+   Display *display;
+   Window xwindow;
+
+   /*
+    * The add is sent every time, because the window manager drops a
+    * window's _NET_WM_STATE when the window is withdrawn, and an earlier add
+    * does not survive the next hide. A remove is sent only after an add.
+    */
+   if (!GetXWindow(&display, &xwindow) || (!above && !mAbove)) {
+      return;
+   }
+
+   SendWmState(above ? 1 : 0,
+               XInternAtom(display, "_NET_WM_STATE_ABOVE", False), None, 2);
+   mAbove = above;
+   g_debug("%s: %s\n", __FUNCTION__, above ? "above other windows" : "normal stacking");
 }
 
 
@@ -1315,11 +1528,15 @@ DragDetWnd::GetGeometry(int &x, int &y, int &width, int &height)
  */
 
 void
-DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
+DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget,
+                         bool above)
 {
   g_debug("%s: enter 0x%lx show %d x %d y %d\n",
          __FUNCTION__,
          (unsigned long) Get_Current_Drop_ctx(), show, x, y);
+
+   /* A show in any role, or a hide, ends the moves of an earlier show. */
+   CancelDropTargetNudges();
 
    /* If the window is being shown, move it to the right place. */
    if (show) {
@@ -1343,8 +1560,38 @@ DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
        * the drag source, and the delay there loses the drop target, so the
        * drag ends in GDK_DRAG_CANCEL_NO_TARGET.
        */
+      int moveX = x + 2;
+      int moveY = y + 2;
+
       if (asDropTarget && mUnderWayland) {
+         int gx, gy, gw, gh;
+
          WaitUntilManaged(DET_WND_MANAGE_TIMEOUT_MS);
+         /*
+          * Mutter maps a window that does not take focus below the focused
+          * window. A drag leaving the guest usually starts in the focused
+          * window, so that window would get the drag instead. The caller
+          * asks for this only under Mutter. See OnDropTargetNudge() for the
+          * rest.
+          */
+         if (above) {
+            SetAbove(true);
+         }
+         /*
+          * A tiling compositor such as sway floats the window where it
+          * chooses, in the middle of the output, not at the edge the pointer
+          * left by. Move the pointer to where the window is.
+          */
+         GetGeometry(gx, gy, gw, gh);
+         if (ABS(gx - x) > 2 || ABS(gy - y) > 2) {
+            if (gw <= 1 || gh <= 1) {
+               gw = gh = DRAG_DET_WINDOW_WIDTH * 2;
+            }
+            moveX = gx + gw / 2;
+            moveY = gy + gh / 2;
+            g_debug("%s: the window is at (%d, %d), not where asked\n",
+                    __FUNCTION__, gx, gy);
+         }
       }
       g_debug("%s: show at (%d, %d, %d, %d)\n", __FUNCTION__, x, y, DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
       /*
@@ -1359,14 +1606,145 @@ DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
        * the target does not get re-entered before the release arrives.
        */
       if (asDropTarget) {
-         SimulateMouseMove(x + 2, y + 2);
+         SimulateMouseMove(moveX, moveY);
       }
       SetIsVisible(true);
+      if (asDropTarget && mUnderWayland) {
+         mNudgeX = moveX;
+         mNudgeY = moveY;
+         mNudgesLeft = DROP_TARGET_NUDGES;
+         mNudgeTimer = g_timeout_add(DROP_TARGET_NUDGE_MS, OnDropTargetNudge,
+                                     this);
+      }
    } else {
       g_debug("%s: hide\n", __FUNCTION__);
       Hide();
       SetIsVisible(false);
    }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DragDetWnd::OnDropTargetNudge --
+ *
+ *    Move the mouse over the drop target again, from the main loop, a few
+ *    times after UpdateDetWnd() shows it under Wayland.
+ *
+ *    The compositor offers a drag to the window under the pointer only when
+ *    the pointer moves. Mutter, for one, does not offer it to the window on
+ *    the move in UpdateDetWnd(), even after raising it, but does on the
+ *    same move made from the main loop moments later. GTK draws the window's first
+ *    frame from the main loop, which UpdateDetWnd() blocks until after its
+ *    move, and that is the likely difference. The pointer is already on the
+ *    window, so the extra moves do nothing else.
+ *
+ * Results:
+ *    G_SOURCE_CONTINUE while nudges are left, else G_SOURCE_REMOVE.
+ *
+ * Side effects:
+ *    Moves the mouse.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+DragDetWnd::OnDropTargetNudge(gpointer data)  // IN: the DragDetWnd
+{
+   DragDetWnd *self = static_cast<DragDetWnd *>(data);
+
+   if (!self->GetIsVisible() || self->mNudgesLeft <= 0) {
+      self->mNudgeTimer = 0;
+      return G_SOURCE_REMOVE;
+   }
+   self->mNudgesLeft--;
+   self->SimulateMouseMove(self->mNudgeX, self->mNudgeY);
+   if (self->mNudgesLeft > 0) {
+      return G_SOURCE_CONTINUE;
+   }
+   self->mNudgeTimer = 0;
+   return G_SOURCE_REMOVE;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DragDetWnd::CancelDropTargetNudges --
+ *
+ *    Stop the moves that UpdateDetWnd() scheduled through
+ *    OnDropTargetNudge().
+ *
+ * Results:
+ *    None.
+ *
+ * Side effects:
+ *    Removes the nudge timer.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DragDetWnd::CancelDropTargetNudges(void)
+{
+   if (mNudgeTimer != 0) {
+      g_source_remove(mNudgeTimer);
+      mNudgeTimer = 0;
+   }
+   mNudgesLeft = 0;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DragDetWnd::OnXEvent --
+ *
+ *    Note when a drag enters the detection window and when it drops on it.
+ *
+ *    GTK keeps the drop after XdndDrop until it has read the value, and
+ *    reports no drop until then. DnDUIX11::OnGHDropCheck() must not take a
+ *    drag that has dropped for one that is still running.
+ *
+ * Results:
+ *    FALSE, so that GDK handles the event as usual.
+ *
+ * Side effects:
+ *    Sets mXdndDropped.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+DragDetWnd::OnXEvent(GdkX11Display *display,   // IN: unused
+                     const XEvent *xevent,     // IN
+                     gpointer data)            // IN: the DragDetWnd
+{
+   DragDetWnd *self = static_cast<DragDetWnd *>(data);
+   Display *xdisplay;
+   Window xwindow;
+
+   if (xevent->type != ClientMessage) {
+      return FALSE;
+   }
+   /* Only the first client message asks the server for the atoms. */
+   if (self->mXdndEnter == None) {
+      self->mXdndEnter = XInternAtom(xevent->xany.display, "XdndEnter", False);
+      self->mXdndDrop = XInternAtom(xevent->xany.display, "XdndDrop", False);
+   }
+   if ((xevent->xclient.message_type != self->mXdndEnter &&
+        xevent->xclient.message_type != self->mXdndDrop) ||
+       !self->GetXWindow(&xdisplay, &xwindow) ||
+       xevent->xclient.window != xwindow) {
+      return FALSE;
+   }
+   self->mXdndDropped = xevent->xclient.message_type == self->mXdndDrop;
+   if (self->mXdndDropped) {
+      g_debug("%s: XdndDrop on the detection window\n", __FUNCTION__);
+   }
+
+   return FALSE;
 }
 
 
@@ -1645,9 +2023,18 @@ DragDetWnd::SimulateXEvents(const bool showWidget, const bool buttonEvent,
         * detection window is never offered the drag.
         *
         * Warp the X pointer to the same coordinates so both agree.
+        *
+        * A host to guest XDND drag needs the opposite. Xwayland carries out
+        * a warp from the client under the pointer by locking the Wayland
+        * pointer, and Mutter's pointer then stays on the detection window
+        * while only Xwayland's moves. Mutter bridges an X11 drag to Wayland
+        * clients by following its own pointer, so the drag never reaches
+        * one. The caller turns the warp off for that drag.
         */
-       XWarpPointer(dndXDisplay, None, DefaultRootWindow(dndXDisplay),
-                    0, 0, 0, 0, x + 1, y + 1);
+       if (mWarpXPointer) {
+          XWarpPointer(dndXDisplay, None, DefaultRootWindow(dndXDisplay),
+                       0, 0, 0, 0, x + 1, y + 1);
+       }
 #endif
    } else {
        XTestFakeMotionEvent(dndXDisplay, -1, x, y, CurrentTime);
