@@ -124,6 +124,10 @@ libdndcp_la_SOURCES += copyPasteDnDWayland.cpp
 libdndcp_la_SOURCES += copyPasteUIWayland.cpp
 libdndcp_la_SOURCES += waylandClipboard/waylandClipboard.c
 libdndcp_la_SOURCES += waylandDrag/waylandDrag.c
+else
+# Without Wayland support a native drag is never available and dndUIX11GTK4
+# uses XDND.
+libdndcp_la_SOURCES += waylandDrag/waylandDragStub.c
 endif
 
 if LINUX

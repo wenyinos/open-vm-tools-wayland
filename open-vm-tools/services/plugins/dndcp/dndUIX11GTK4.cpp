@@ -38,6 +38,7 @@ extern "C" {
 
 #include "copyPasteCompat.h"
 #include "dndClipboard.h"
+#include "hgfs.h"
 #include "hgfsUri.h"
 #include "rpcout.h"
 }
@@ -54,6 +55,28 @@ extern "C" {
 #endif
 
 #include "copyPasteDnDWrapper.h"
+#include "waylandDrag.h"
+
+#include <fcntl.h>
+#include <glib/gstdio.h>
+
+/*
+ * How long to wait for the compositor to deliver a faked press. The wait
+ * ends as soon as the press arrives. The full time passes only when the
+ * compositor sent the press somewhere else, and the drag then falls back to
+ * XDND.
+ */
+#define WAYLAND_DRAG_PRESS_TIMEOUT_MS 250
+
+/*
+ * How long the target has to catch up with the pointer before the button is
+ * released. A file manager that will take the drop accepts within a few tens
+ * of milliseconds. OnSrcDrop() waits this long up to three times, with a
+ * nudge and then WaylandDrag_Refocus() in between, and then releases the
+ * button whatever the target said. A target that still refuses loses the
+ * drop.
+ */
+#define WAYLAND_DRAG_ACCEPT_TIMEOUT_MS 500
 
 
 /*
@@ -80,6 +103,9 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
       mGHReads(NULL),
       mInHGDrag(false),
       mHGButtonDown(false),
+      mWaylandDragActive(false),
+      mWaylandDragGen(0),
+      mHGDeferBlock(false),
       mEffect(DROP_NONE),
       mMousePosX(0),
       mMousePosY(0),
@@ -145,6 +171,12 @@ DnDUIX11::~DnDUIX11()
       }
    }
    ResetUI();
+   /*
+    * Also for a drag that is armed but has not started. Any done() from
+    * WaylandDrag_Exit() then finds a stale ticket.
+    */
+   LocalCancelWaylandDrag();
+   WaylandDrag_Exit();
 }
 
 
@@ -203,6 +235,13 @@ DnDUIX11::Init()
 #undef CONNECT_SIGNAL
 
    mDetWnd->UpdateDetWnd(false, 0, 0);
+
+   /*
+    * Optional. Where the compositor does not support a native drag source,
+    * host to guest drags use XDND. OnSrcDragBegin() tries again if this
+    * fails.
+    */
+   WaylandDrag_Init();
    goto out;
 fail:
    ret = false;
@@ -268,6 +307,14 @@ DnDUIX11::ResetUI()
 {
    TRACE_CALL();
    /*
+    * The button is about to be released, and a native drag would take that
+    * as the drop. The caller of the reset has decided the drag is over, so
+    * cancel the drag rather than drop it on whatever is under the pointer.
+    */
+   if (mWaylandDragActive) {
+      LocalCancelWaylandDrag();
+   }
+   /*
     * The press faked to start a host to guest drag is released by the host
     * when it drops. If the drag never started there is nothing to drop, and
     * a button left down through uinput holds the pointer in a drag for the
@@ -293,7 +340,205 @@ DnDUIX11::ResetUI()
    mEffect = DROP_NONE;
    mInHGDrag = false;
    CancelGHRead();
+   ClearFilePlaceholders();
    RemoveBlock();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::LocalWaylandDragPreferred --
+ *
+ *      Whether the drag about to start will try the native Wayland source
+ *      before XDND.
+ *
+ *      The source is chosen when the first motion arrives, and the native one
+ *      can still fail then and fall back to XDND. The staging decisions have
+ *      to be made before the offer is built, so they are made on these
+ *      conditions.
+ *
+ * Results:
+ *      True if the native source will be tried.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIX11::LocalWaylandDragPreferred(void)
+{
+#ifdef USE_UINPUT
+   return WaylandDrag_IsAvailable() && FakeMouse_IsInit();
+#else
+   return false;
+#endif
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::StageFilePlaceholders --
+ *
+ *      Create an empty entry in the staging directory for every file the host
+ *      is dragging.
+ *
+ *      A file manager stats the URIs it is offered while the pointer is still
+ *      moving, to decide whether it can take the drop at all, and refuses
+ *      what it cannot stat. Nothing is in the staging directory until the
+ *      host has dropped, so without this the offer never becomes acceptable.
+ *      The entries are only placeholders. AddBlockForDrop() adds the block at
+ *      drop time, and the block keeps readers out until the host has filled
+ *      the entries in.
+ *
+ * Results:
+ *      True if the whole list was staged, in which case the caller owns the
+ *      entries until the transfer finishes or the drag is cancelled.
+ *
+ * Side effects:
+ *      Creates files and directories under mHGStagingDir.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIX11::StageFilePlaceholders(const DnDFileList &fList)   // IN
+{
+   std::vector<std::string> relPaths = fList.GetRelPaths();
+   std::vector<CPFileAttributes> attrs = fList.GetFileAttributes();
+   utf::string root = mHGStagingDir;
+   size_t i;
+
+   if (   mBlockCtrl == NULL
+       || !DnD_BlockIsReady(mBlockCtrl)
+       || root.empty()
+       || relPaths.empty()) {
+      return false;
+   }
+   while (root.length() > 1 && root[root.length() - 1] == DIRSEPC) {
+      root.erase(root.length() - 1);
+   }
+
+   for (i = 0; i < relPaths.size(); i++) {
+      const std::string &rel = relPaths[i];
+      bool isDir =    i < attrs.size()
+                   && attrs[i].fileType == HGFS_FILE_TYPE_DIRECTORY;
+      std::string full;
+      char *parent;
+      bool ok;
+
+      /*
+       * The list comes from the host. Each name becomes a path under the
+       * staging directory and then an entry in a uri-list. The file contents
+       * path uses the same check.
+       */
+      if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
+         g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
+                 rel.c_str());
+         goto error;
+      }
+
+      full = std::string(root.c_str()) + DIRSEPS + rel;
+      parent = isDir ? g_strdup(full.c_str())
+                     : g_path_get_dirname(full.c_str());
+      ok = g_mkdir_with_parents(parent, 0755) == 0;
+      g_free(parent);
+      if (!ok) {
+         g_debug("%s: cannot create directories for %s: %s\n", __FUNCTION__,
+                 full.c_str(), g_strerror(errno));
+         goto error;
+      }
+      if (!isDir) {
+         int fd = g_open(full.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+         if (fd < 0) {
+            g_debug("%s: cannot create %s: %s\n", __FUNCTION__, full.c_str(),
+                    g_strerror(errno));
+            goto error;
+         }
+         close(fd);
+      }
+   }
+
+   g_debug("%s: staged %" FMTSZ "u placeholders under %s\n", __FUNCTION__,
+           (size_t)relPaths.size(), root.c_str());
+   return true;
+
+error:
+   DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
+   return false;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::AddBlockForDrop --
+ *
+ *      Add the block now, just before the target reads.
+ *
+ *      The staged entries are placeholders until the host fills them in, so
+ *      the block has to hold the target's read until OnGetFilesDone() reports
+ *      that the bytes are there. It must not go in earlier. While the target
+ *      is still deciding whether to take the drop, it has to be able to stat
+ *      what it was offered.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::AddBlockForDrop(void)
+{
+   if (!mHGDeferBlock) {
+      return;
+   }
+   AddBlock();
+   /* From here on the host fills in the staged entries. */
+   mHGDeferBlock = false;
+
+   /*
+    * With no block the target reads the placeholders as they are, and
+    * copies a set of empty files as if they were the drop. Without them it
+    * finds nothing, and fails the drop where the user can see it.
+    */
+   if (!mBlockAdded && !mHGStagingDir.empty()) {
+      g_warning("%s: no block for %s; withdrawing the placeholders\n",
+                __FUNCTION__, mHGStagingDir.c_str());
+      DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::ClearFilePlaceholders --
+ *
+ *      Undo StageFilePlaceholders() where the host never sent the files.
+ *
+ *      Left behind they would look to a target like empty files, and they
+ *      would also stop the staging directory from being reused.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::ClearFilePlaceholders(void)
+{
+   /*
+    * The drop and OnGetFilesDone() clear the flag, so a set flag here means
+    * the host sent nothing.
+    */
+   if (!mHGDeferBlock) {
+      return;
+   }
+   mHGDeferBlock = false;
+   if (mHGStagingDir.empty()) {
+      return;
+   }
+   g_debug("%s: dropping the placeholders in %s\n", __FUNCTION__,
+           mHGStagingDir.c_str());
+   DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
 }
 
 
@@ -319,8 +564,23 @@ DnDUIX11::AddBlock()
    TRACE_CALL();
 
    if (mBlockAdded) {
-      g_debug("%s: block already added\n", __FUNCTION__);
-      return;
+      if (mBlockedPath == mHGStagingDir) {
+         g_debug("%s: block already added\n", __FUNCTION__);
+         return;
+      }
+      /*
+       * A block still in place on another directory belongs to a drag that
+       * is over, and mBlockAdded refers to that block. Treating it as this
+       * drag's block would leave this directory unblocked and aim the later
+       * removal at the wrong path.
+       */
+      g_debug("%s: releasing the block left on %s\n", __FUNCTION__,
+              mBlockedPath.c_str());
+      if (DnD_BlockIsReady(mBlockCtrl)) {
+         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mBlockedPath.c_str());
+      }
+      mBlockAdded = false;
+      mBlockedPath = "";
    }
 
    g_debug("%s: DnDBlockIsReady %d fd %d\n", __FUNCTION__,
@@ -329,6 +589,7 @@ DnDUIX11::AddBlock()
    if (   DnD_BlockIsReady(mBlockCtrl)
        && mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str())) {
       mBlockAdded = true;
+      mBlockedPath = mHGStagingDir;
       g_debug("%s: add block for %s.\n", __FUNCTION__, mHGStagingDir.c_str());
    } else {
       mBlockAdded = false;
@@ -359,12 +620,14 @@ DnDUIX11::RemoveBlock()
    TRACE_CALL();
 
    if (mBlockAdded && (DND_FILE_TRANSFER_IN_PROGRESS != mHGGetFileStatus)) {
-      g_debug("%s: removing block for %s\n", __FUNCTION__, mHGStagingDir.c_str());
+      /* mBlockedPath is where the block went in. mHGStagingDir may differ. */
+      g_debug("%s: removing block for %s\n", __FUNCTION__, mBlockedPath.c_str());
       /* We need to make sure block subsystem has not been shut off. */
       if (DnD_BlockIsReady(mBlockCtrl)) {
-         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
+         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mBlockedPath.c_str());
       }
       mBlockAdded = false;
+      mBlockedPath = "";
    } else {
       g_debug("%s: not removing block mBlockAdded %d mHGGetFileStatus %d\n",
               __FUNCTION__, mBlockAdded, mHGGetFileStatus);
@@ -375,49 +638,93 @@ DnDUIX11::RemoveBlock()
 /*
  *-----------------------------------------------------------------------------
  *
- * DnDUIX11::LocalSetContentProvider --
+ * DnDUIX11::AddDragItem --
  *
- *      Set content provider based on different desktop type.
- *
- * Results:
- *      None.
+ *      Record one format of what the host is dragging.
  *
  * Side effects:
- *      mProvider is chanaged.
+ *      mDragItems grows.
  *
  *-----------------------------------------------------------------------------
  */
 
 void
-DnDUIX11::LocalSetContentProvider(const char* desktop)   // IN
+DnDUIX11::AddDragItem(const char *mimeType,  // IN
+                      const void *data,      // IN
+                      size_t size)           // IN
+{
+   DragItem item;
+
+   item.mimeType = mimeType;
+   item.data.assign(static_cast<const char *>(data), size);
+   mDragItems.push_back(item);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::LocalSetContentProvider --
+ *
+ *      Collect what the host is dragging, once, for both drag sources.
+ *
+ *      The Wayland source offers the same MIME types and bytes as the Gtk
+ *      one, and the source is chosen only when the drag starts. The formats
+ *      are therefore collected here, and the provider is built from them.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      mDragItems and mProvider are replaced.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::LocalSetContentProvider()
 {
    std::vector<Glib::RefPtr<Gdk::ContentProvider>> providerVec;
-   Glib::RefPtr<Glib::Bytes> fileList;
    void *buf;
    size_t sz;
 
    g_debug("%s: enter.\n", __FUNCTION__);
 
+   mDragItems.clear();
+
    if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILELIST) ||
        CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILECONTENTS)) {
-      /* The caller has already framed the list for this desktop. */
-      fileList = Glib::Bytes::create(mHGDndUriList.c_str(), mHGDndUriList.bytes());
-      providerVec.push_back(Gdk::ContentProvider::create(DRAG_TARGET_NAME_URI_LIST, fileList));
+      /*
+       * The caller has already framed the list for this desktop. Do not
+       * offer an empty list. A target that asks for the type and gets
+       * nothing sees a successful transfer of zero bytes, which GTK turns
+       * into a NULL vector.
+       */
+      if (mHGDndUriList.bytes() > 0) {
+         AddDragItem(DRAG_TARGET_NAME_URI_LIST, mHGDndUriList.c_str(),
+                     mHGDndUriList.bytes());
+      } else {
+         g_debug("%s: the host's file list came out empty\n", __FUNCTION__);
+      }
    } else if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_RTF)) {
       if (CPClipboard_GetItem(&mClipboard, CPFORMAT_RTF, &buf, &sz)) {
          g_debug("%s: RTF data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
-         Glib::RefPtr<Glib::Bytes> rtfData = Glib::Bytes::create(buf, sz);
-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_APPLICATION_RTF, rtfData));
-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_RICHTEXT, rtfData));
-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_RTF, rtfData));
+         AddDragItem(TARGET_NAME_APPLICATION_RTF, buf, sz);
+         AddDragItem(TARGET_NAME_TEXT_RICHTEXT, buf, sz);
+         AddDragItem(TARGET_NAME_TEXT_RTF, buf, sz);
       }
    } else if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_TEXT)) {
       if (CPClipboard_GetItem(&mClipboard, CPFORMAT_TEXT, &buf, &sz)) {
          g_debug("%s: Text data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
-         Glib::RefPtr<Glib::Bytes> textData = Glib::Bytes::create(buf, sz);
-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN, textData));
-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN_UTF8, textData));
+         AddDragItem(TARGET_NAME_TEXT_PLAIN, buf, sz);
+         AddDragItem(TARGET_NAME_TEXT_PLAIN_UTF8, buf, sz);
       }
+   }
+
+   for (const DragItem &item : mDragItems) {
+      providerVec.push_back(
+         Gdk::ContentProvider::create(item.mimeType,
+            Glib::Bytes::create(item.data.data(), item.data.size())));
    }
    mProvider = Gdk::ContentProvider::create(providerVec);
 }
@@ -451,7 +758,7 @@ DnDUIX11::BuildFileURIList(utf::string& uriList,         // IN/OUT
    while ((str = GetNextPath(mHGFCPData, pos).c_str()).bytes() != 0) {
       g_debug("%s: Path: %s", __FUNCTION__, str.c_str());
       uriList += pre;
-      if (mBlockAdded) {
+      if (mBlockAdded || mHGDeferBlock) {
          uriList += mBlockCtrl->blockRoot;
          uriList += DIRSEPS + stagingDirName + DIRSEPS + str + post;
       } else {
@@ -688,6 +995,23 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
    bool hasContent = false;
    mHGDragStarted = false;
 
+   /*
+    * A native drag that the host has finished with can still be waiting for
+    * the target or the compositor. While it runs, this drag's first motion
+    * would fall back to XDND, and its end would arrive in the middle of this
+    * drag.
+    */
+   LocalCancelWaylandDrag();
+
+   /*
+    * The compositor may have been slow to answer at login, or its
+    * connection may have dropped since. WaylandDrag_Init() returns at once
+    * outside Wayland and where the compositor lacks what a native drag needs.
+    */
+   if (!WaylandDrag_IsAvailable()) {
+      WaylandDrag_Init();
+   }
+
    /* The host's coordinates are for the screen as it is now. */
    mDetWnd->RefreshScreenSize();
 
@@ -709,6 +1033,13 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
    size_t sz;
 
    mHGFCPData.clear();
+   /*
+    * LocalSetContentProvider() replaces these only when the host sent a
+    * format that is offered here. For a drag with none, both drag sources
+    * would otherwise offer the previous drag's data.
+    */
+   mDragItems.clear();
+   mProvider.reset();
 
    if (CPClipboard_GetItem(&mClipboard, CPFORMAT_FILELIST, &buf, &sz)) {
       mHGStagingDir = utf::string(stagingDir.c_str());
@@ -729,10 +1060,12 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
       }
 
       /*
-       * Every name below goes into the uri-list with only percent escaping,
-       * and resolves under the vmblock mount. A name that leads out of the
-       * staging directory, or ends a uri-list entry early, publishes a path
-       * where nothing was staged.
+       * For both drag sources every name below goes into the uri-list with
+       * only percent escaping, and resolves under the vmblock mount. A name
+       * that leads out of the staging directory, or ends a uri-list entry
+       * early, publishes a path where nothing was staged.
+       * StageFilePlaceholders() checks again, and when it fails the drag
+       * continues with an ordinary block.
        */
       if (!LocalFileListIsSafe(fList)) {
          g_warning("%s: refusing a file list with an unusable name\n",
@@ -744,10 +1077,27 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
       // Provide path within vmblock file system instead of actual path.
       mHGFCPData = fList.GetRelPathsStr();
 
-      if (!mBlockAdded) {
+      /*
+       * A vmblock entry makes every lookup below the staging directory wait,
+       * path resolution included, and a file manager such as Thunar stats
+       * what it is offered while the pointer is still over it. A block added
+       * here would stall the target, and the target would refuse the drop.
+       * The files are therefore staged empty, and the block is added at the
+       * drop, the first moment the bytes have to be right. This holds for
+       * the native drag and for XDND alike.
+       */
+      {
+         void *attrBuf;
+         size_t attrSz;
+
+         if (CPClipboard_GetItem(&mClipboard, CPFORMAT_FILEATTRIBUTES,
+                                 &attrBuf, &attrSz)) {
+            fList.AttributesFromCPClipboard(attrBuf, attrSz);
+         }
+         mHGDeferBlock = StageFilePlaceholders(fList);
+      }
+      if (!mHGDeferBlock) {
          AddBlock();
-      } else {
-         g_debug("%s: not calling AddBlock\n", __FUNCTION__);
       }
       if (mHGGetFileStatus != DND_FILE_TRANSFER_IN_PROGRESS) {
          mHGGetFileStatus = DND_FILE_TRANSFER_IN_PROGRESS;
@@ -771,13 +1121,190 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
 
    /* finally set the guest clipboard */
    if (hasContent) {
-      LocalSetContentProvider(desktop);
+      LocalSetContentProvider();
    }
 
    SourceDragStartDone();
    /* Initialize host hide feedback to DROP_NONE. */
    mEffect = DROP_NONE;
    SourceUpdateFeedback(mEffect);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::OnWaylandDragDone --
+ *
+ *      The native drag ended, whatever the reason.
+ *
+ *      A Wayland drag emits none of the GtkDragSource signals, so when the
+ *      drag ends without a host drop, only this function releases the faked
+ *      press. Without it the uinput button stays down for the rest of the
+ *      session and the desktop looks frozen.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::OnWaylandDragDone(void *ctx)   // IN: a WaylandDragTicket
+{
+   WaylandDragTicket *ticket = (WaylandDragTicket *)ctx;
+   DnDUIX11 *this_instance = ticket->ui;
+   bool current = ticket->gen == this_instance->mWaylandDragGen;
+
+   TRACE_CALL();
+   delete ticket;
+   /*
+    * The host returns to READY without waiting for the compositor, on a
+    * cancel, on GET_FILES_DONE and on a drop of anything but files. The next
+    * drag can be running by the time this drag's end arrives, and a reset
+    * then would release the new drag's button in the middle of it.
+    */
+   if (!current) {
+      g_debug("%s: the end of a drag already given up\n", __FUNCTION__);
+      return;
+   }
+   this_instance->mWaylandDragActive = false;
+   if (this_instance->mHGGetFileStatus != DND_FILE_TRANSFER_IN_PROGRESS) {
+      this_instance->ResetUI();
+   } else if (this_instance->mHGButtonDown) {
+      /*
+       * A file drop keeps its staging state until the transfer is done. The
+       * drag itself is over, and the host drop that would release the
+       * button may never come.
+       */
+      g_debug("%s: releasing the faked button\n", __FUNCTION__);
+#ifdef USE_UINPUT
+      FakeMouse_Click(false);
+#endif
+      this_instance->mHGButtonDown = false;
+   }
+   this_instance->mInHGDrag = false;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::LocalStartWaylandDrag --
+ *
+ *      Start the host to guest drag as a native Wayland drag.
+ *
+ * Results:
+ *      True if the compositor took the drag. The button then stays down
+ *      until OnSrcDrop() or OnWaylandDragDone() releases it. False leaves no
+ *      native drag behind and the button up, and the caller falls back to
+ *      XDND.
+ *
+ * Side effects:
+ *      Fakes a pointer press.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIX11::LocalStartWaylandDrag(int32 x,   // IN: pointer x-coord
+                                int32 y)   // IN: pointer y-coord
+{
+#ifdef USE_UINPUT
+   std::vector<WaylandDragItem> items;
+
+   if (!WaylandDrag_IsAvailable() || !FakeMouse_IsInit() ||
+       mDragItems.empty()) {
+      return false;
+   }
+
+   for (const DragItem &item : mDragItems) {
+      WaylandDragItem wItem;
+
+      wItem.mimeType = item.mimeType.c_str();
+      wItem.data = item.data.data();
+      wItem.size = item.data.size();
+      items.push_back(wItem);
+   }
+
+   if (!WaylandDrag_Arm(&items[0], items.size())) {
+      return false;
+   }
+
+   /*
+    * The detection window has no part in a native drag, and under Xwayland
+    * the compositor treats it like any other window. Left mapped at the
+    * corner of the work area, it can be offered the drop itself, and the
+    * drop is lost.
+    */
+   ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
+
+   /*
+    * Use uinput directly rather than SimulateXEvents(), which also shows,
+    * moves and raises the X11 detection window and warps the X pointer. That
+    * all serves XDND. Raising an Xwayland window under the cursor would also
+    * take the press away from the overlay.
+    *
+    * FakeMouse_Button() skips the pause that FakeMouse_Click() takes after
+    * each button event for GTK's drag detection.
+    * WaylandDrag_StartOnPress() below waits for the press on the Wayland
+    * connection instead. The host's RPC messages wait behind any sleep here.
+    * If the user lets go of a quick drag during the sleep, the host cancels
+    * the drag before the guest drag has started.
+    */
+   FakeMouse_Button(false);
+   FakeMouse_Move(x, y);
+   FakeMouse_Move(x + 1, y + 1);
+   FakeMouse_Button(true);
+
+   WaylandDragTicket *ticket = new WaylandDragTicket;
+
+   ticket->ui = this;
+   ticket->gen = ++mWaylandDragGen;
+   if (!WaylandDrag_StartOnPress(WAYLAND_DRAG_PRESS_TIMEOUT_MS,
+                                 OnWaylandDragDone, ticket)) {
+      /* done() is never called for a drag that did not start. */
+      delete ticket;
+      WaylandDrag_Disarm();
+      /*
+       * The press went to some other surface. Let go of it, and map the
+       * detection window again for the XDND drag the caller falls back to.
+       * The window manager adopts the window some time after the map, and a
+       * press before that lands on whatever is under the pointer.
+       */
+      FakeMouse_Button(false);
+      ShowDetWnd(true, mOriginX, mOriginY, DET_WND_PRESS_TARGET);
+      return false;
+   }
+
+   mWaylandDragActive = true;
+   g_debug("%s: dragging %" FMTSZ "u formats natively\n", __FUNCTION__,
+           (size_t)items.size());
+
+   return true;
+#else
+   return false;
+#endif
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::LocalCancelWaylandDrag --
+ *
+ *      End the native drag, if there is one, and forget it.
+ *
+ * Side effects:
+ *      Any later done(), including the one this causes, is stale and
+ *      ignored, so the caller does its own cleanup.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::LocalCancelWaylandDrag(void)
+{
+   mWaylandDragGen++;
+   mWaylandDragActive = false;
+   WaylandDrag_Cancel();
 }
 
 
@@ -804,59 +1331,87 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
    mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
    mMousePosX = x;
    mMousePosY = y;
+#ifdef USE_UINPUT
+   if (mWaylandDragActive) {
+      /* Serve the target between host motions. See WaylandDrag_Pump(). */
+      WaylandDrag_Pump();
+   }
+#endif
 
    if (mInHGDrag) {
-      if (!mHGDragStarted) {
-         /*
-          * We want to simulate the mouse press and hold to trigger drag_begin
-          * event for GtkDragSource, do it here rather than SrcDragBegin as
-          * we want to get the mouse position.
-          *
-          * Before the DnD, we should make sure that the mouse is released
-          * otherwise it may be another DnD, not ours. Send a release, then
-          * a press here to cover this case.
-          */
-         int detX = 0, detY = 0, detW = 0, detH = 0;
-         int pressX = x, pressY = y;
-
-         /*
-          * GTK starts the drag from a press followed by motion on the
-          * detection window itself, so the press has to land on it. A
-          * compositor may put the window somewhere other than the requested
-          * position, and a tiling one does, so press where the window is.
-          */
-         mDetWnd->GetGeometry(detX, detY, detW, detH);
-         if (detW > 0 && detH > 0) {
-            pressX = detX + detW / 2;
-            pressY = detY + detH / 2;
-            if (pressX != x || pressY != y) {
-               g_debug("%s: pressing on the detection window at (%d, %d), "
-                       "not the pointer at (%d, %d)\n", __FUNCTION__,
-                       pressX, pressY, x, y);
-            }
-         }
-         mDetWnd->SimulateXEvents(true, true, false, true, true, pressX, pressY);
-         // simulate drag mouse press
-         mDetWnd->SimulateXEvents(false, true, true, false, true, pressX, pressY);
-         mHGButtonDown = true;
-         // Tell Gtk that a drag should be started from this widget.
-         mDetWnd->StartDrag(mProvider, pressX, pressY);
-
-         /*
-          * Put the pointer back where the host has it. The press had to
-          * land on the detection window, but the drag follows the pointer
-          * from here. Waiting for the next motion from the host leaves the
-          * XDND handshake less time than it needs before the host drops.
-          */
-         if (pressX != x || pressY != y) {
-            mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
-         }
-         mHGDragStarted = true;
-      }
+      /*
+       * Send feedback to the host before starting the drag. The host
+       * chooses between a drop and a cancel from the feedback it has when
+       * the user lets go. Starting the drag maps the overlay and waits for
+       * the press, and the user can let go of a quick drag in that time.
+       * With no feedback yet, the host cancels. With feedback, the host's
+       * drop waits in the RPC queue until the drag below has started.
+       */
       if (mEffect != DROP_MOVE) {
          mEffect = DROP_MOVE;
          g_debug("%s: Updating feedback\n", __FUNCTION__);
          SourceUpdateFeedback(mEffect);
+      }
+      if (!mHGDragStarted) {
+         /*
+          * Both drag sources hold the button down from here on, and it has
+          * to be released however the drag ends.
+          */
+         mHGButtonDown = true;
+
+         /*
+          * A native Wayland drag reaches Wayland and X11 targets alike. An
+          * XDND drag from the Xwayland detection window reaches Wayland
+          * targets only where the compositor bridges it. wlroots does not, so
+          * under sway every drop onto a Wayland application is lost. Use the
+          * native source where there is one, and XDND everywhere else.
+          */
+         if (!LocalStartWaylandDrag(x, y)) {
+            /*
+             * We want to simulate the mouse press and hold to trigger
+             * drag_begin event for GtkDragSource, do it here rather than
+             * SrcDragBegin as we want to get the mouse position.
+             *
+             * Before the DnD, we should make sure that the mouse is released
+             * otherwise it may be another DnD, not ours. Send a release, then
+             * a press here to cover this case.
+             */
+            int detX = 0, detY = 0, detW = 0, detH = 0;
+            int pressX = x, pressY = y;
+
+            /*
+             * GTK starts the drag from a press followed by motion on the
+             * detection window itself, so the press has to land on it. A
+             * compositor may put the window somewhere other than the requested
+             * position, and a tiling one does, so press where the window is.
+             */
+            mDetWnd->GetGeometry(detX, detY, detW, detH);
+            if (detW > 0 && detH > 0) {
+               pressX = detX + detW / 2;
+               pressY = detY + detH / 2;
+               if (pressX != x || pressY != y) {
+                  g_debug("%s: pressing on the detection window at (%d, %d), "
+                          "not the pointer at (%d, %d)\n", __FUNCTION__,
+                          pressX, pressY, x, y);
+               }
+            }
+            mDetWnd->SimulateXEvents(true, true, false, true, true, pressX, pressY);
+            // simulate drag mouse press
+            mDetWnd->SimulateXEvents(false, true, true, false, true, pressX, pressY);
+            // Tell Gtk that a drag should be started from this widget.
+            mDetWnd->StartDrag(mProvider, pressX, pressY);
+
+            /*
+             * Put the pointer back where the host has it. The press had to
+             * land on the detection window, but the drag follows the pointer
+             * from here. Waiting for the next motion from the host leaves the
+             * XDND handshake less time than it needs before the host drops.
+             */
+            if (pressX != x || pressY != y) {
+               mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
+            }
+         }
+         mHGDragStarted = true;
       }
    }
 }
@@ -883,6 +1438,11 @@ DnDUIX11::OnSrcCancel()
 {
    TRACE_CALL();
    /*
+    * A native drag would take the release below as its drop, onto whatever
+    * is under the pointer.
+    */
+   LocalCancelWaylandDrag();
+   /*
     * Force the window to show, position the mouse over it, and release.
     * Seems like moving the window to 0, 0 eliminates frequently observed
     * flybacks when we cancel as user moves mouse in and out of destination
@@ -900,6 +1460,7 @@ DnDUIX11::OnSrcCancel()
    mInHGDrag = false;
    mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
    mEffect = DROP_NONE;
+   ClearFilePlaceholders();
    RemoveBlock();
 }
 
@@ -984,6 +1545,30 @@ DnDUIX11::OnDestCancel()
 /*
  *-----------------------------------------------------------------------------
  *
+ * DnDUIX11::NudgeWaylandDrag --
+ *
+ *      Move the pointer one pixel and back. The compositor and the target
+ *      under the drag check the drag again only on pointer motion.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::NudgeWaylandDrag(void *ctx)   // IN: the DnDUIX11
+{
+#ifdef USE_UINPUT
+   DnDUIX11 *ui = static_cast<DnDUIX11 *>(ctx);
+
+   FakeMouse_Move(ui->mMousePosX > 0 ? ui->mMousePosX - 1 : ui->mMousePosX + 1,
+                  ui->mMousePosY);
+   FakeMouse_Move(ui->mMousePosX, ui->mMousePosY);
+#endif
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * DnDUIX11::OnSrcDrop --
  *
  *      Callback when host signals drop.
@@ -1001,6 +1586,59 @@ void
 DnDUIX11::OnSrcDrop()
 {
    TRACE_CALL();
+#ifdef USE_UINPUT
+   if (mWaylandDragActive) {
+      /*
+       * Showing the detection window maps and raises an Xwayland window, and
+       * SimulateXEvents() also warps the X pointer. Either one loses a native
+       * drag. Even after the target has accepted, the compositor then
+       * cancels the drag instead of dropping. Leave the detection
+       * window and the X pointer alone, and use uinput and the Wayland
+       * connection only.
+       */
+      FakeMouse_Move(mMousePosX, mMousePosY);
+
+      /*
+       * The compositor decides the drop on the target's last answer. The
+       * host moves the pointer faster than a file manager answers, so when
+       * the host lets go, the last answer is often a refusal for an earlier
+       * motion. Give the target time to catch up before releasing the
+       * button.
+       *
+       * AddBlockForDrop() adds the block only after the wait. To decide, the
+       * target stats the files it was offered, and with a block in place that
+       * stat does not return. When the placeholders could not be staged,
+       * OnSrcDragBegin() added the block already, and this wait runs out.
+       */
+      if (!WaylandDrag_WaitForAccept(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS)) {
+         /*
+          * A file manager fetches the offer's contents and decides only on a
+          * motion that comes after they arrive. When the pointer has already
+          * stopped, no such motion comes, so move the pointer one pixel and
+          * back.
+          */
+         g_debug("%s: nudging the pointer for an answer\n", __FUNCTION__);
+         NudgeWaylandDrag(this);
+         if (!WaylandDrag_WaitForAccept(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS)) {
+            /*
+             * A target that still refuses may be judging this drag on the
+             * contents of an earlier one, as WaylandDrag_Refocus()
+             * describes. Make it see the drag leave and come back.
+             */
+            g_debug("%s: taking the drag off the target and back\n",
+                    __FUNCTION__);
+            WaylandDrag_Refocus(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS,
+                                NudgeWaylandDrag, this);
+         }
+      }
+      AddBlockForDrop();
+      FakeMouse_Click(false);
+      mHGButtonDown = false;
+      mInHGDrag = false;
+      return;
+   }
+#endif
+   AddBlockForDrop();
    ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
 
    /*
@@ -1043,6 +1681,26 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
     */
 
    mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
+
+   /*
+    * The host decides when this arrives, and the RPC layer does not check
+    * that a transfer was requested, so it can arrive before the drop at
+    * which OnSrcDrop() adds the block. The RemoveBlock() below then does
+    * nothing, and the drop would add a block that nothing removes. The
+    * application that took the drop would then wait in open() forever.
+    * Clear mHGDeferBlock so that the drop adds no block. The uri-list still
+    * names the files through the vmblock mount, which passes lookups
+    * straight through to the files the host has written when the staging
+    * directory has no block.
+    *
+    * Only mHGDeferBlock says that this drag's block is still to come.
+    * mBlockAdded can be left over from another drag, and checking it here
+    * would let the drop add the block anyway.
+    */
+   if (mHGDeferBlock) {
+      g_debug("%s: files done before the drop; not blocking\n", __FUNCTION__);
+      mHGDeferBlock = false;
+   }
 
    if (!mInHGDrag) {
       ResetUI();
@@ -1089,7 +1747,7 @@ DnDUIX11::ShowDetWnd(bool show,      // IN: show (true) or hide (false)
        * manager. The caller passes the role because mInHGDrag is not set yet
        * when that drag begins.
        */
-      mDetWnd->UpdateDetWnd(show, x, y, role == DET_WND_DROP_TARGET);
+      mDetWnd->UpdateDetWnd(show, x, y, role != DET_WND_DRAG_SOURCE);
    } else {
       g_debug("%s: hide\n", __FUNCTION__);
       mDetWnd->UpdateDetWnd(show, x, y);

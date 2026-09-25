@@ -102,6 +102,24 @@ gboolean WaylandDrag_StartOnPress(unsigned int timeoutMs,
 /* Handle what the compositor has sent so far, without waiting. */
 void WaylandDrag_Pump(void);
 
+/* Wait until the target will take the drop, or until timeoutMs has passed. */
+gboolean WaylandDrag_WaitForAccept(unsigned int timeoutMs);
+
+/*
+ * Move the pointer one pixel away and back. The compositor checks what is
+ * under the cursor again only on pointer motion.
+ */
+typedef void (*WaylandDragNudgeFunc)(void *clientData);
+
+/*
+ * Make the target see the drag leave and come back, then wait for it as
+ * WaylandDrag_WaitForAccept() does. This is for a target that is still
+ * judging the drag on the contents of an earlier one.
+ */
+gboolean WaylandDrag_Refocus(unsigned int timeoutMs,
+                             WaylandDragNudgeFunc nudge,
+                             void *clientData);
+
 /* Discard an armed drag that never started. done() is not called. */
 void WaylandDrag_Disarm(void);
 

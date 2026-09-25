@@ -31,6 +31,7 @@ bool FakeMouse_IsInit();
 bool FakeMouse_Update(int width, int height);
 void FakeMouse_Destory();
 bool FakeMouse_Move(int x, int y);
+bool FakeMouse_Button(bool down);
 bool FakeMouse_Click(bool down);
 
 #endif // __FAKE_MOUSE_WAYLAND_H__

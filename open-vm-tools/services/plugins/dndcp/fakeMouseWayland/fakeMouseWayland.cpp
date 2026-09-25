@@ -327,9 +327,9 @@ FakeMouse_Move(int x,    // IN
 /*
  *-----------------------------------------------------------------------------
  *
- * FakeMouse_Click --
+ * FakeMouse_Button --
  *
- *      Simulate the pointer down/up event.
+ *      Simulate the pointer down/up event, without waiting for it to be seen.
  *
  * Results:
  *      True if success.
@@ -341,7 +341,7 @@ FakeMouse_Move(int x,    // IN
  */
 
 bool
-FakeMouse_Click(bool down)  // IN
+FakeMouse_Button(bool down)  // IN
 {
    if (!FakeMouse_IsInit()) {
       return false;
@@ -366,6 +366,31 @@ FakeMouse_Click(bool down)  // IN
       g_debug("Line:%d. Function:%s. Failed to write\n", __LINE__, __FUNCTION__);
       retValue = false;
    }
+
+   return retValue;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * FakeMouse_Click --
+ *
+ *      Simulate the pointer down/up event, and give userspace time to see it.
+ *
+ * Results:
+ *      True if success.
+ *
+ * Side effects:
+ *      Pointer button event is updated.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+FakeMouse_Click(bool down)  // IN
+{
+   bool retValue = FakeMouse_Button(down);
 
    /*
     * Insert a pause here so that userspace has time to detect this event,

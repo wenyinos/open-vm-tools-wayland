@@ -72,10 +72,10 @@
 #define WAYLAND_DRAG_SEND_BUDGET_US (4 * G_USEC_PER_SEC)
 
 /*
- * How long this module waits for the compositor in WaylandDrag_Init() and
- * WaylandDrag_Arm(). These waits run on the plugin's main loop, which also
- * carries the RPC channel, and a compositor that has stopped answering must
- * not stall it.
+ * How long this module waits for the compositor in WaylandDrag_Init(),
+ * WaylandDrag_Arm() and the shield phase of WaylandDrag_Refocus(). These
+ * waits run on the plugin's main loop, which also carries the RPC channel,
+ * and a compositor that has stopped answering must not stall it.
  */
 #define WAYLAND_DRAG_REPLY_TIMEOUT_MS 500
 
@@ -93,6 +93,19 @@
  * drag after this long takes nothing a working target still needs.
  */
 #define WAYLAND_DRAG_FINISH_TIMEOUT_S 10
+
+/*
+ * How long an accept has to remain the target's latest answer before the
+ * button is released on it.
+ */
+#define WAYLAND_DRAG_QUIET_MS 30
+
+/*
+ * How long WaylandDrag_Refocus() gives the target to fetch the new offer
+ * before moving the pointer again so it decides on it.
+ */
+#define WAYLAND_DRAG_REFOCUS_SETTLE_MS 150
+
 
 typedef struct {
    char *mimeType;
@@ -112,6 +125,8 @@ typedef struct {
    int modeWidth;
    int modeHeight;
    int32_t transform;
+   /* A shield from WaylandDrag_Refocus(), mapped even while gDrag.hidden. */
+   gboolean shield;
 } DragOverlay;
 
 static struct {
@@ -127,9 +142,19 @@ static struct {
 
    DragOverlay overlays[WAYLAND_DRAG_MAX_OUTPUTS];
    size_t nOverlays;
+   /* Short-lived overlays that take the drag off a target, for Refocus. */
+   DragOverlay shields[WAYLAND_DRAG_MAX_OUTPUTS];
+   size_t nShields;
    gboolean mapped;
    /* The overlays were unmapped for the drag. A configure must not remap. */
    gboolean hidden;
+   /*
+    * Counts configures that mapped an overlay, so WaylandDrag_Refocus() can
+    * tell when its shields are mapped.
+    */
+   unsigned int configures;
+   /* The drag is over the overlay rather than over a target. */
+   gboolean overlayEntered;
 
    /*
     * The surface the pointer is over. A press can come only from that
@@ -671,9 +696,10 @@ OfferDestroy(struct wl_data_offer *offer)   // IN/OPT
  *    The compositor must stop offering the drag to the overlay as soon as
  *    HideOverlays() runs. These data device events are the only way to see
  *    that, because the rest of this module sees only the source's side of
- *    the drag. An enter that is not followed straight away by a leave, or any
- *    drop here, means the overlay is taking the drop away from the
- *    application under it.
+ *    the drag. Outside WaylandDrag_Refocus(), an enter that is not followed
+ *    straight away by a leave, or any drop here, means the overlay is taking
+ *    the drop away from the application under it. WaylandDrag_Refocus()
+ *    waits for the enter on a shield.
  *
  *-----------------------------------------------------------------------------
  */
@@ -702,6 +728,7 @@ DeviceEnter(void *d,                     // IN: unused
             struct wl_data_offer *o)     // IN: unused
 {
    DragIsReal();
+   gDrag.overlayEntered = TRUE;
    g_debug("%s: the overlay was offered the drag\n", __FUNCTION__);
 }
 
@@ -710,6 +737,7 @@ DeviceLeave(void *d,                    // IN: unused
             struct wl_data_device *dd)  // IN: unused
 {
    g_debug("%s: the drag left the overlay\n", __FUNCTION__);
+   gDrag.overlayEntered = FALSE;
    OfferDestroy(gDrag.offer);
    gDrag.offer = NULL;
 }
@@ -850,9 +878,10 @@ MakeOverlay(DragOverlay *o)   // IN/OUT: output set, the rest empty
 /*
  *-----------------------------------------------------------------------------
  *
- * DestroyOverlay --
+ * DestroyOverlay, DestroyShields --
  *
- *    Destroy an overlay's objects, keeping its output.
+ *    Destroy an overlay's objects, keeping its output. DestroyShields() does
+ *    it for every shield and forgets them.
  *
  *-----------------------------------------------------------------------------
  */
@@ -874,12 +903,26 @@ DestroyOverlay(DragOverlay *o)   // IN/OUT
    }
 }
 
+static void
+DestroyShields(void)
+{
+   size_t i;
+
+   for (i = 0; i < gDrag.nShields; i++) {
+      DestroyOverlay(&gDrag.shields[i]);
+   }
+   memset(gDrag.shields, 0, sizeof gDrag.shields);
+   gDrag.nShields = 0;
+}
+
+
 /*
  *-----------------------------------------------------------------------------
  *
  * Unmap --
  *
- *    Destroy the overlays. The connection and the bound globals stay.
+ *    Destroy the overlays and the shields. The connection and the bound
+ *    globals stay.
  *
  *-----------------------------------------------------------------------------
  */
@@ -892,9 +935,11 @@ Unmap(void)
    for (i = 0; i < gDrag.nOverlays; i++) {
       DestroyOverlay(&gDrag.overlays[i]);
    }
+   DestroyShields();
    gDrag.focus = NULL;
    gDrag.mapped = FALSE;
    gDrag.hidden = FALSE;
+   gDrag.overlayEntered = FALSE;
    if (gDrag.display != NULL) {
       wl_display_flush(gDrag.display);
    }
@@ -1029,6 +1074,12 @@ PointerButton(void *data,                 // IN: unused
                                  WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
    }
 
+   /*
+    * Otherwise the previous drag's last answer would count for this drag
+    * until the new target answers, WaylandDrag_WaitForAccept() would return
+    * TRUE on it, and the caller would release the button.
+    */
+   gDrag.accepted = FALSE;
    gDrag.sendBudgetUs = WAYLAND_DRAG_SEND_BUDGET_US;
 
    /* No drag icon. The host draws one on its side of the window. */
@@ -1230,7 +1281,7 @@ LayerSurfaceConfigure(void *data,                             // IN: DragOverlay
     * put the overlay back over the cursor in the middle of the drag, undoing
     * what HideOverlays() just did.
     */
-   if (gDrag.hidden) {
+   if (gDrag.hidden && !o->shield) {
       g_debug("%s: configure %ux%u while hidden, staying unmapped\n",
               __FUNCTION__, width, height);
       return;
@@ -1257,6 +1308,7 @@ LayerSurfaceConfigure(void *data,                             // IN: DragOverlay
    wl_surface_damage(o->surface, 0, 0, o->width, o->height);
    wl_surface_commit(o->surface);
    gDrag.mapped = TRUE;
+   gDrag.configures++;
 }
 
 
@@ -1397,6 +1449,8 @@ RegistryGlobalRemove(void *data,                   // IN: unused
       if (o->output == NULL || o->name != name) {
          continue;
       }
+      /* Shields share the overlays' outputs. */
+      DestroyShields();
       if (o->layer != NULL) {
          zwlr_layer_surface_v1_destroy(o->layer);
       }
@@ -1941,6 +1995,89 @@ lost:
 /*
  *-----------------------------------------------------------------------------
  *
+ * WaylandDrag_WaitForAccept --
+ *
+ *    Wait until the deadline for the target to say it will take the drop.
+ *
+ *    The compositor decides the drop on the last answer the target sent, and
+ *    a file manager answers each pointer motion with an accept followed by
+ *    two refusals. The host moves the pointer much faster than a file manager
+ *    keeps up. When the host stops and releases, the last answer is whatever
+ *    part of that backlog the target had reached. About a third of the time
+ *    it is a refusal, and the drop is discarded. The pointer has stopped, so
+ *    nothing prompts the target again, and the release has to wait here.
+ *
+ * Results:
+ *    True if the target is willing, false if it refused or ran out of time.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+WaylandDrag_WaitForAccept(unsigned int timeoutMs)   // IN
+{
+   gint64 started = g_get_monotonic_time();
+   gint64 deadline = started + (gint64) timeoutMs * 1000;
+
+   if (!gDrag.inited || !gDrag.dragging) {
+      return FALSE;
+   }
+
+   while (gDrag.dragging) {
+      int left;
+      int r;
+
+      /*
+       * The answer already received may be the start of a burst the target
+       * sent while the pointer was still moving. Releasing on that accept
+       * loses the drop to the refusals behind it. A round trip dispatches
+       * everything the compositor has already sent, so the answer after it
+       * is the one the drop will be decided on. The round trip uses the same
+       * deadline as the rest of the wait.
+       */
+      r = SyncUntil(deadline);
+      if (r < 0) {
+         return FALSE;
+      }
+      if (r == 0 || !gDrag.dragging) {
+         break;
+      }
+
+      left = (int) ((deadline - g_get_monotonic_time()) / 1000);
+      if (left <= 0) {
+         break;
+      }
+      if (gDrag.accepted) {
+         /*
+          * A target that has fallen behind the pointer is still answering
+          * motions from before the pointer stopped. The refusal behind an
+          * accept can then arrive in the time the button release takes to
+          * go through uinput and the compositor. Release only on an accept
+          * that is still current after a pause.
+          */
+         left = MIN(left, WAYLAND_DRAG_QUIET_MS);
+      }
+      r = ReadOnce(left, NULL);
+      if (r < 0) {
+         return FALSE;
+      }
+      if (r == 0 && gDrag.accepted) {
+         /* Nothing arrived in the pause, so the accept is current. */
+         break;
+      }
+   }
+
+   g_debug("%s: target %s after %" G_GINT64_FORMAT "ms\n", __FUNCTION__,
+           gDrag.accepted ? "is willing" : "never agreed",
+           (g_get_monotonic_time() - started) / 1000);
+
+   return gDrag.accepted;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
  * WaylandDrag_Pump --
  *
  *    Handle whatever the compositor has sent, without waiting.
@@ -1967,6 +2104,127 @@ WaylandDrag_Pump(void)
       return;
    }
    wl_display_flush(gDrag.display);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * WaylandDrag_Refocus --
+ *
+ *    Move the drag off the target and back, then wait for its answer.
+ *
+ *    A target can carry state from one drag into the next. Thunar asks for
+ *    the URI list on the first motion it handles. When the pointer crosses
+ *    its window faster than Thunar keeps up, Thunar handles that motion after
+ *    the leave. It keeps the list that comes back and judges the next drag
+ *    over its window by that list, which names files an earlier drag staged
+ *    and that are gone by then. It refuses on every motion without asking
+ *    for the new offer, and only another leave clears that.
+ *
+ *    So map a fresh overlay, a shield, on each output and nudge the pointer,
+ *    and the compositor moves the drag onto the shield. Then destroy the
+ *    shields and nudge again, and the compositor enters the target afresh
+ *    with the new offer.
+ *
+ *    The overlay the drag started from cannot be used for this. It was
+ *    unmapped for the drag, and an unmapped layer surface returns to the
+ *    unconfigured state, in which KWin never configures it again.
+ *
+ * Results:
+ *    True if the target is willing, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+gboolean
+WaylandDrag_Refocus(unsigned int timeoutMs,        // IN
+                    WaylandDragNudgeFunc nudge,    // IN
+                    void *clientData)              // IN
+{
+   gint64 deadline;
+   unsigned int configuresBefore;
+   size_t i;
+   int r;
+
+   if (!gDrag.inited || !gDrag.dragging || nudge == NULL ||
+       gDrag.nShields != 0) {
+      return FALSE;
+   }
+
+   deadline = g_get_monotonic_time() +
+              (gint64) WAYLAND_DRAG_REPLY_TIMEOUT_MS * 1000;
+   configuresBefore = gDrag.configures;
+   for (i = 0; i < gDrag.nOverlays; i++) {
+      if (gDrag.overlays[i].output != NULL) {
+         DragOverlay *o = &gDrag.shields[gDrag.nShields++];
+
+         o->output = gDrag.overlays[i].output;
+         o->shield = TRUE;
+         MakeOverlay(o);
+      }
+   }
+   while (gDrag.dragging &&
+          gDrag.configures - configuresBefore < gDrag.nShields) {
+      int left = (int) ((deadline - g_get_monotonic_time()) / 1000);
+
+      if (left <= 0) {
+         break;
+      }
+      r = ReadOnce(left, NULL);
+      if (r < 0) {
+         return FALSE;
+      }
+   }
+   if (gDrag.configures == configuresBefore) {
+      g_debug("%s: no shield was configured\n", __FUNCTION__);
+      DestroyShields();
+      return FALSE;
+   }
+   r = SyncUntil(deadline);
+   if (r < 0) {
+      return FALSE;
+   }
+   if (!gDrag.dragging) {
+      DestroyShields();
+      return FALSE;
+   }
+
+   nudge(clientData);
+   while (gDrag.dragging && !gDrag.overlayEntered) {
+      int left = (int) ((deadline - g_get_monotonic_time()) / 1000);
+
+      if (left <= 0) {
+         break;
+      }
+      r = ReadOnce(left, &gDrag.overlayEntered);
+      if (r < 0) {
+         return FALSE;
+      }
+   }
+   g_debug("%s: %s\n", __FUNCTION__, gDrag.overlayEntered ?
+           "the target let go of the drag" : "the shield never got the drag");
+
+   DestroyShields();
+   gDrag.accepted = FALSE;
+   r = SyncUntil(deadline);
+   if (r < 0 || !gDrag.dragging) {
+      return FALSE;
+   }
+   nudge(clientData);
+
+   /*
+    * The new enter makes the target ask for the offer's contents, but the
+    * target decides only on a motion that comes after they arrive, and the
+    * last nudge came before. Nudge again if it has not accepted.
+    */
+   if (WaylandDrag_WaitForAccept(WAYLAND_DRAG_REFOCUS_SETTLE_MS) ||
+       !gDrag.dragging) {
+      return gDrag.accepted;
+   }
+   nudge(clientData);
+
+   return WaylandDrag_WaitForAccept(timeoutMs);
 }
 
 

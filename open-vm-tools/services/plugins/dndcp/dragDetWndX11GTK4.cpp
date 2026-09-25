@@ -28,6 +28,7 @@
 #include "tracer.hh"
 #include "dragDetWndX11GTK4.h"
 #include "dndUIX11GTK4.h"
+#include "waylandDrag.h"
 #include <list>
 
 extern "C" {
@@ -231,8 +232,11 @@ DragDetWnd::~DragDetWnd()
  *    coordinates beyond the old size. The GTK3 build checks the screen
  *    size in DnDUIX11::OnSrcDragBegin() for the same reason.
  *
- *    This opens a fresh connection, because Xlib updates the screen size of
- *    an open connection only for a client that processes RandR events itself.
+ *    In a Wayland session with one output, the size comes from that
+ *    output's mode. See WaylandDrag_GetOutputSize() for why the X screen
+ *    does not do there. Otherwise this opens a fresh X connection, because
+ *    Xlib updates the screen size of an open connection only for a client
+ *    that processes RandR events itself.
  *
  * Side effects:
  *    Recreates the uinput device if the size has changed. If that fails the
@@ -245,29 +249,38 @@ void
 DragDetWnd::RefreshScreenSize(void)
 {
 #ifdef USE_UINPUT
-   Display *display;
-   Screen *scrn;
+   int width;
+   int height;
+   const char *source = "Wayland output";
 
    if (!mUseUInput) {
       return;
    }
-   display = XOpenDisplay(NULL);
-   if (display == NULL) {
-      return;
+   if (!WaylandDrag_GetOutputSize(&width, &height)) {
+      Display *display = XOpenDisplay(NULL);
+      Screen *scrn;
+
+      if (display == NULL) {
+         return;
+      }
+      scrn = DefaultScreenOfDisplay(display);
+      width = scrn->width;
+      height = scrn->height;
+      XCloseDisplay(display);
+      source = "X screen";
    }
-   scrn = DefaultScreenOfDisplay(display);
-   if (scrn->width != mScreenWidth || scrn->height != mScreenHeight) {
-      g_debug("%s: screen is now %dx%d, was %dx%d\n", __FUNCTION__,
-              scrn->width, scrn->height, mScreenWidth, mScreenHeight);
-      if (FakeMouse_Update(scrn->width, scrn->height)) {
-         mScreenWidth = scrn->width;
-         mScreenHeight = scrn->height;
+   if (width != mScreenWidth || height != mScreenHeight) {
+      g_debug("%s: screen is now %dx%d from the %s, was %dx%d\n",
+              __FUNCTION__, width, height, source, mScreenWidth,
+              mScreenHeight);
+      if (FakeMouse_Update(width, height)) {
+         mScreenWidth = width;
+         mScreenHeight = height;
       } else {
          g_warning("%s: could not recreate the uinput device\n", __FUNCTION__);
          mUseUInput = false;
       }
    }
-   XCloseDisplay(display);
 #endif
 }
 

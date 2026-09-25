@@ -120,9 +120,10 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
     * Drag and drop is delegated to DnDUIX11, which needs GTK on its X11
     * backend. Under a Wayland session that makes the detection window an
     * Xwayland client. DnDUIX11 then uses XDND, which the compositor bridges
-    * to native clients. The X11-specific code would crash on a Wayland
-    * GdkSurface. This mirrors CopyPasteDnDX11::Init. Where the compositor has
-    * no ext-data-control-v1, copy and paste owns the X selection through GDK
+    * to native clients, or a native Wayland drag source where layer shell
+    * exists. The X11-specific code would crash on a Wayland GdkSurface. This
+    * mirrors CopyPasteDnDX11::Init. Where the compositor has no
+    * ext-data-control-v1, copy and paste owns the X selection through GDK
     * and learns from GDK when the selection changes.
     */
    gdk_set_allowed_backends("x11");
@@ -262,8 +263,10 @@ CopyPasteDnDWayland::UnregisterCP()
  *
  * CopyPasteDnDWayland::RegisterDnD --
  *
- *    Drag and drop is delegated to DnDUIX11, which drives XDND through
- *    Xwayland. A drag is driven by real pointer input, so it does not need the
+ *    Drag and drop is delegated to DnDUIX11. For a host to guest drag it uses
+ *    a native Wayland drag source from a layer shell surface where the
+ *    compositor offers wlr-layer-shell, and XDND through Xwayland otherwise.
+ *    A drag is driven by real pointer input, so it does not need the
  *    data-control protocols. Without GTK there is no drag and drop.
  *
  *-----------------------------------------------------------------------------

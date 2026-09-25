@@ -24,7 +24,9 @@
  * ext-data-control-v1, or else the X selection through GDK, which GNOME
  * keeps in step with the Wayland one.
  * Drag and drop is delegated to DnDUIX11, which runs its detection window
- * under Xwayland. The RPC transport runs on the toolbox GLib main loop.
+ * under Xwayland and adds a native Wayland drag source where the compositor
+ * offers wlr-layer-shell. The RPC transport runs on the toolbox GLib main
+ * loop.
  */
 
 #ifndef __COPYPASTEDNDWAYLAND_H__

@@ -80,6 +80,10 @@ private:
     */
    void AddBlock();
    void RemoveBlock();
+   bool LocalWaylandDragPreferred(void);
+   bool StageFilePlaceholders(const DnDFileList &fList);
+   void ClearFilePlaceholders(void);
+   void AddBlockForDrop(void);
    void
    BuildFileURIList(utf::string& uriList,
                     utf::string pre,
@@ -93,7 +97,8 @@ private:
    void LocalRefuseDrag(void);
    void LocalGetFileRequest(utf::string stagingDirName, const char *desktop);
    void LocalGetFileContentsRequest(const char *desktop);
-   void LocalSetContentProvider(const char* desktop);
+   void AddDragItem(const char *mimeType, const void *data, size_t size);
+   void LocalSetContentProvider();
 
    /*
     * Callbacks from Common DnD layer.
@@ -122,12 +127,23 @@ private:
 
    /*
     * The role the detection window plays while it is shown. A drag has to
-    * find a drop target, but nothing has to find a drag source.
+    * find a drop target, and a press has to find the window it is meant
+    * for, but nothing has to find a drag source.
     */
    typedef enum {
       DET_WND_DROP_TARGET,
+      DET_WND_PRESS_TARGET,
       DET_WND_DRAG_SOURCE
    } DetWndRole;
+
+   /*
+    * One format of what the host is dragging. Both drag sources offer the
+    * same bytes under the same MIME types, so they are collected once.
+    */
+   typedef struct {
+      std::string mimeType;
+      std::string data;    /* Raw bytes, which may include NULs. */
+   } DragItem;
 
    /*
     * Callbacks for showing/hiding detection window.
@@ -137,6 +153,22 @@ private:
    void OnDestMoveDetWndToMousePos();
    void SourceDragStartDone();
    void SourceUpdateFeedback(DND_DROPEFFECT effect);
+
+   /* Native Wayland drag source, where the compositor supports one. */
+   bool LocalStartWaylandDrag(int32 x, int32 y);
+   void LocalCancelWaylandDrag(void);
+   static void OnWaylandDragDone(void *ctx);
+   static void NudgeWaylandDrag(void *ctx);
+
+   /*
+    * The argument to the native drag's done(). It records which drag it was,
+    * so that the end of an abandoned drag is not taken for the end of the
+    * next one. OnWaylandDragDone() frees it.
+    */
+   typedef struct {
+      DnDUIX11 *ui;
+      unsigned int gen;
+   } WaylandDragTicket;
 
    /*
     * Gtk+ Callbacks: Drag Source
@@ -200,6 +232,8 @@ private:
    DnDBlockControl *mBlockCtrl;
    DND_FILE_TRANSFER_STATUS mHGGetFileStatus;
    bool mBlockAdded;
+   /* The path the current block was added on, which RemoveBlock() removes. */
+   utf::string mBlockedPath;
 
    /* State to determine if drag motion is a drag enter. */
    bool mGHDnDInProgress;
@@ -213,6 +247,12 @@ private:
    bool mHGDragStarted;
    /* A faked press is outstanding; it must not outlive the drag. */
    bool mHGButtonDown;
+   /* A native Wayland drag is running, so the XDND teardown must not run. */
+   bool mWaylandDragActive;
+   /* Which native drag is current; a done() for any other is ignored. */
+   unsigned int mWaylandDragGen;
+   /* The staging directory holds placeholders, and the drop adds the block. */
+   bool mHGDeferBlock;
    DND_DROPEFFECT mEffect;
    int32 mMousePosX;
    int32 mMousePosY;
@@ -223,6 +263,8 @@ private:
    /* GdkSurface used in dnd */
    Glib::RefPtr< Gdk::Surface > mGdkSurface;
    Glib::RefPtr<Gdk::ContentProvider> mProvider;
+   /* The same formats the provider carries, for the Wayland drag source. */
+   std::vector<DragItem> mDragItems;
    utf::string mHGDndUriList;
    utf::utf8string mHGFCPData;
 
