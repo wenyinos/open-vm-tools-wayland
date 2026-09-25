@@ -28,11 +28,70 @@
 
 #include "copyPasteDnDUtil.h"
 #include "file.h"
+#include "str.h"
 #include "dndFileContentsUtil.h"
 #include "dndFileList.hh"
 #include "copyPasteUIX11.h"
 extern "C" {
 #include "cpNameUtil.h"
+}
+
+
+/*
+ *----------------------------------------------------------------------------
+ *
+ * LocalIsSafeStagingName --
+ *
+ *      Check that a host supplied file name is NUL terminated and can only
+ *      name something below the staging directory it will be appended to.
+ *
+ *      Every path that joins a host supplied name onto a staging directory
+ *      uses this check, so that they agree on what a staged name may be.
+ *
+ * Results:
+ *      true if the name is safe to use, false otherwise.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------------
+ */
+
+bool
+LocalIsSafeStagingName(const char *name,     // IN: host supplied file name
+                       size_t len)           // IN: bytes at name
+{
+   const char *comp = name;
+
+   if (len == 0 || name[len - 1] != '\0') {
+      return false;
+   }
+
+   if (*name == '\0' || File_IsFullPath(name)) {
+      return false;
+   }
+
+   /*
+    * CR and LF each end an entry in a text/uri-list, and this name is put
+    * into one. A name carrying either would be published as several entries,
+    * the extra ones naming whatever the host chose.
+    */
+   if (Str_Strchr(name, '\r') != NULL || Str_Strchr(name, '\n') != NULL) {
+      return false;
+   }
+
+   while (comp != NULL) {
+      if (Str_Strncmp(comp, "..", 2) == 0 &&
+          (comp[2] == '\0' || comp[2] == DIRSEPC)) {
+         return false;
+      }
+      comp = Str_Strchr(comp, DIRSEPC);
+      if (comp != NULL) {
+         comp++;
+      }
+   }
+
+   return true;
 }
 
 
@@ -139,6 +198,17 @@ LocalPrepareFileContents(const CPClipboard *clip,                       // IN
                              fileItem[i].cpName.cpName_len - 1,
                              '\0',
                              DIRSEPC);
+
+      /*
+       * The name is host supplied and is about to be joined onto the staging
+       * directory, so it must not be able to name anything outside of it.
+       */
+      if (!LocalIsSafeStagingName(fileItem[i].cpName.cpName_val,
+                                  fileItem[i].cpName.cpName_len)) {
+         Warning("%s: unsafe fileItem[%" FMTSZ "u].cpName.\n", __FUNCTION__, i);
+         goto exit;
+      }
+
       fileName = fileItem[i].cpName.cpName_val;
       filePathName = tempDir;
       filePathName += DIRSEPS + fileName;

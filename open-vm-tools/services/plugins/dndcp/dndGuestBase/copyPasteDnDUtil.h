@@ -34,4 +34,7 @@
 bool LocalPrepareFileContents(const CPClipboard *clip,
                               std::vector<utf::string>& fileContentsList);
 
+bool LocalIsSafeStagingName(const char *name,
+                            size_t len);
+
 #endif

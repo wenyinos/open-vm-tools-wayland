@@ -489,6 +489,7 @@ DnDFileList::FromCPClipboard(const void *buf,   // IN: Source buffer
 {
    const CPFileList *flist;
    std::string relPaths;
+   size_t payloadLen;
 
    ASSERT(buf);
    ASSERT(len);
@@ -496,7 +497,22 @@ DnDFileList::FromCPClipboard(const void *buf,   // IN: Source buffer
       return false;
    }
 
+   /*
+    * The header and its length fields come straight off the wire, so nothing
+    * may be dereferenced until they have been checked against len.
+    */
+   if (len < CPFILELIST_HEADER_SIZE) {
+      return false;
+   }
+
    flist = reinterpret_cast<const CPFileList *>(buf);
+   payloadLen = len - CPFILELIST_HEADER_SIZE;
+
+   if (flist->relPathsLen > payloadLen ||
+       flist->fulPathsLen > payloadLen - flist->relPathsLen) {
+      return false;
+   }
+
    relPaths.assign(
       reinterpret_cast<const char *>(flist->filelists), flist->relPathsLen);
 
@@ -542,7 +558,17 @@ DnDFileList::AttributesFromCPClipboard(const void *buf, // IN: Source buffer
       return false;
    }
 
+   if (len < URI_ATTRIBUTES_LIST_HEADER_SIZE) {
+      return false;
+   }
+
    alist = reinterpret_cast<const CPAttributeList *>(buf);
+
+   /* attributesLen is host supplied, and must fit in the bytes received. */
+   if (alist->attributesLen >
+       (len - URI_ATTRIBUTES_LIST_HEADER_SIZE) / sizeof (CPFileAttributes)) {
+      return false;
+   }
 
    mAttributeList.resize(alist->attributesLen);
    for (uint32 i = 0; i < alist->attributesLen; i++) {

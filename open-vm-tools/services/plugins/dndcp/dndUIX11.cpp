@@ -63,6 +63,7 @@ extern "C" {
 #endif
 
 #include "copyPasteDnDWrapper.h"
+#include "copyPasteDnDUtil.h"
 
 
 /*
@@ -1078,6 +1079,18 @@ DnDUIX11::OnGtkDragDataGet(
          return;
       }
 
+      /*
+       * The names come from the host and are published as paths below the
+       * staging directory. Refuse the list if any of them could leave it.
+       */
+      for (const std::string &rel : fList.GetRelPaths()) {
+         if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
+            g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
+                    rel.c_str());
+            return;
+         }
+      }
+
       mTotalFileSize = fList.GetFileSize();
 
       /* Provide URIs for each path in the guest's file list. */
@@ -1437,9 +1450,18 @@ DnDUIX11::SetCPClipboardFromGtk(const Gtk::SelectionData& sd) // IN
          }
 #endif
          /*
-          * Parse relative path.
+          * Parse relative path. The drag source controls these bytes, and an
+          * entry such as "file:foo" has no path separator. Skip it instead
+          * of pointing past the end of the string.
           */
-         newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1; // Point to char after '/'
+         newRelPath = Str_Strrchr(newPath, DIRSEPC);
+         if (newRelPath == NULL) {
+            g_debug("%s: skipping uri without a path separator '%s'\n",
+                    __FUNCTION__, newPath);
+            free(newPath);
+            continue;
+         }
+         newRelPath++; // Point to char after '/'
 
          /* Keep track of how big the dnd files are. */
          if ((size = File_GetSizeEx(newPath)) >= 0) {
@@ -1683,6 +1705,8 @@ DnDUIX11::GetNextPath(utf::utf8string& str,     // IN: NUL-delimited path list
           ubyte == '*' ||   /* "Special significance within specific schemes" */
           ubyte == '!' ||   /* "Special significance within specific schemes" */
           ubyte == '%' ||   /* Escape character */
+          ubyte == '\r' ||  /* Ends an entry in a uri-list */
+          ubyte == '\n' ||  /* Ends an entry in a uri-list */
           ubyte >= 0x80) {  /* UTF-8 encoding bytes */
          str.replace(index, 1, "%");
          str.insert(index + 1, 1, Dec2Hex[ubyte >> 4]);

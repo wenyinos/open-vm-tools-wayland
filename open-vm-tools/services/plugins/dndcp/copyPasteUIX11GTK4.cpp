@@ -794,9 +794,18 @@ CopyPasteUIX11::CopyPasteSendFile(const Glib::RefPtr<Gio::AsyncResult>& result) 
 #endif
 
       /*
-       * Parse relative path.
+       * Parse relative path. The clipboard owner controls these bytes, and
+       * an entry such as "file:foo" has no path separator. Skip it instead
+       * of pointing past the end of the string.
        */
-      newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1; // Point to char after '/'
+      newRelPath = Str_Strrchr(newPath, DIRSEPC);
+      if (newRelPath == NULL) {
+         g_debug("%s: skipping uri without a path separator '%s'\n",
+                 __FUNCTION__, newPath);
+         free(newPath);
+         continue;
+      }
+      newRelPath++; // Point to char after '/'
 
       /* Keep track of how big the fcp files are. */
       if ((size = File_GetSizeEx(newPath)) >= 0) {
@@ -1236,6 +1245,8 @@ CopyPasteUIX11::GetNextPath(utf::utf8string& str, // IN: NUL-delimited path list
           ubyte == '*' ||   /* "Special significance within specific schemes" */
           ubyte == '!' ||   /* "Special significance within specific schemes" */
           ubyte == '%' ||   /* Escape character */
+          ubyte == '\r' ||  /* Ends an entry in a uri-list */
+          ubyte == '\n' ||  /* Ends an entry in a uri-list */
           ubyte >= 0x80) {  /* UTF-8 encoding bytes */
          str.replace(index, 1, "%");
          str.insert(index + 1, 1, Dec2Hex[ubyte >> 4]);
@@ -1449,7 +1460,22 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
    if (CPClipboard_GetItem(clip, CPFORMAT_FILELIST, &buf, &sz)) {
       g_debug("%s: File data.\n", __FUNCTION__);
       DnDFileList flist;
-      flist.FromCPClipboard(buf, sz);
+      if (!flist.FromCPClipboard(buf, sz)) {
+         g_debug("%s: malformed file list\n", __FUNCTION__);
+         return;
+      }
+
+      /*
+       * The names come from the host and are published as paths below the
+       * staging directory. Refuse the list if any of them could leave it.
+       */
+      for (const std::string &rel : flist.GetRelPaths()) {
+         if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
+            g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
+                    rel.c_str());
+            return;
+         }
+      }
       mTotalFileSize = flist.GetFileSize();
       mHGFCPData = flist.GetRelPathsStr();
       mHGGetListTime = GetCurrentTime();

@@ -489,7 +489,17 @@ DnDUIX11::LocalGetFileRequest(utf::string stagingDirName,
       /* Setting Gnome URIs for each path in the guest's file list. */
       BuildFileURIList(mHGDndUriList, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST, stagingDirName);
       /* Nautilus on Gnome does not expect FCP_GNOME_LIST_POST after the last uri. See bug 143147. */
-      mHGDndUriList.erase(mHGDndUriList.size() - strlen(FCP_GNOME_LIST_POST));
+      size_t postLen = strlen(FCP_GNOME_LIST_POST);
+      if (mHGDndUriList.length() >= postLen &&
+          mHGDndUriList.compare(mHGDndUriList.length() - postLen,
+                                postLen,
+                                FCP_GNOME_LIST_POST) == 0) {
+         /*
+          * The list is empty when there are no files, and an unguarded
+          * subtraction would wrap and make erase() throw out of the main loop.
+          */
+         mHGDndUriList.erase(mHGDndUriList.length() - postLen);
+      }
       g_debug("%s: providing file list [%s]\n", __FUNCTION__, mHGDndUriList.c_str());
    } else if (desktop && strstr(desktop, "KDE")) {
       /* Setting KDE URIs for each path in the guest's file list. */
@@ -526,7 +536,17 @@ DnDUIX11::LocalGetFileContentsRequest(const char *desktop)
       /* Setting Gnome URIs for each path in the guest's file list. */
       BuildFileContentURIList(mHGDndUriList, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST);
       /* Nautilus on Gnome does not expect FCP_GNOME_LIST_POST after the last uri. See bug 143147. */
-      mHGDndUriList.erase(mHGDndUriList.size() - strlen(FCP_GNOME_LIST_POST));
+      size_t postLen = strlen(FCP_GNOME_LIST_POST);
+      if (mHGDndUriList.length() >= postLen &&
+          mHGDndUriList.compare(mHGDndUriList.length() - postLen,
+                                postLen,
+                                FCP_GNOME_LIST_POST) == 0) {
+         /*
+          * The list is empty when there are no files, and an unguarded
+          * subtraction would wrap and make erase() throw out of the main loop.
+          */
+         mHGDndUriList.erase(mHGDndUriList.length() - postLen);
+      }
       g_debug("%s: providing file list [%s]\n", __FUNCTION__, mHGDndUriList.c_str());
    } else if (desktop && strstr(desktop, "KDE")) {
       /* Setting KDE URIs for each path in the guest's file list. */
@@ -539,6 +559,71 @@ DnDUIX11::LocalGetFileContentsRequest(const char *desktop)
 
 
 /* Source functions for HG DnD. */
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::LocalFileListIsSafe --
+ *
+ *      Whether every relative path in a host file list names something below
+ *      the staging directory and can be published as one uri-list entry.
+ *
+ * Results:
+ *      True if all of them can, false at the first that cannot.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIX11::LocalFileListIsSafe(const DnDFileList &fList)   // IN
+{
+   std::vector<std::string> relPaths = fList.GetRelPaths();
+
+   for (const std::string &rel : relPaths) {
+      if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
+         g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
+                 rel.c_str());
+         return false;
+      }
+   }
+
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::LocalRefuseDrag --
+ *
+ *      Abandon a host to guest drag that has just begun.
+ *
+ *      Returning from OnSrcDragBegin() without SourceDragStartDone() leaves
+ *      the state machine in DRAGBEGIN_PENDING, and the host's next drag then
+ *      only resets it. Resetting here runs OnSrcCancel() over the state the
+ *      drag begin set up, and leaves the state machine ready.
+ *
+ * Side effects:
+ *      Clears the clipboard copy and the file list, and resets mDnD.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIX11::LocalRefuseDrag(void)
+{
+   mHGFCPData.clear();
+   mHGDndUriList = "";
+   CPClipboard_Clear(&mClipboard);
+   mDnD->GetRpc()->SrcCancel(mDnD->GetSessionId());
+   /*
+    * This deletes the GuestDnDSrc whose signal called this function. The
+    * GuestDnDSrc touches none of its members after the signal returns, so
+    * the delete is safe.
+    */
+   mDnD->ResetDnD();
+}
 
 
 /*
@@ -594,11 +679,26 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
       if (stagingDirName.length() == 0) {
          g_debug("%s: Cannot get staging directory name, stagingDir: %s\n",
                  __FUNCTION__, mHGStagingDir.c_str());
+         LocalRefuseDrag();
          return;
       }
 
       if (!fList.FromCPClipboard(buf, sz)) {
          g_debug("%s: Can't get data from clipboard\n", __FUNCTION__);
+         LocalRefuseDrag();
+         return;
+      }
+
+      /*
+       * Every name below goes into the uri-list with only percent escaping,
+       * and resolves under the vmblock mount. A name that leads out of the
+       * staging directory, or ends a uri-list entry early, publishes a path
+       * where nothing was staged.
+       */
+      if (!LocalFileListIsSafe(fList)) {
+         g_warning("%s: refusing a file list with an unusable name\n",
+                   __FUNCTION__);
+         LocalRefuseDrag();
          return;
       }
       mTotalFileSize = fList.GetFileSize();
@@ -1373,7 +1473,7 @@ bool DnDUIX11::SetCPClipboardFromGtk_File(utf::string &source)
    size_t index = 0;
    char *newPath;
    size_t newPathLen;
-   uint64 totalSize;
+   uint64 totalSize = 0;
    int64 size;
 
    g_debug("%s: Got file list: [%s]\n", __FUNCTION__, source.c_str());
@@ -1424,9 +1524,19 @@ bool DnDUIX11::SetCPClipboardFromGtk_File(utf::string &source)
       }
 #endif
       /*
-       * Parse relative path.
+       * Parse relative path. The drag source controls these bytes. An entry
+       * with no path separator, such as the bare "file:foo" form, or with
+       * nothing after the last separator has no relative part. Skip it
+       * instead of pointing past the end of the string.
        */
-      newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1; // Point to char after '/'
+      newRelPath = Str_Strrchr(newPath, DIRSEPC);
+      if (newRelPath == NULL || newRelPath[1] == '\0') {
+         g_debug("%s: skipping uri without a relative path '%s'\n",
+                 __FUNCTION__, newPath);
+         free(newPath);
+         continue;
+      }
+      newRelPath++; // Point to char after '/'
 
       /* Keep track of how big the dnd files are. */
       if ((size = File_GetSizeEx(newPath)) >= 0) {
@@ -1554,10 +1664,6 @@ bool DnDUIX11::SetCPClipboardFromGtk_RTF(utf::string &source)
 bool
 DnDUIX11::SetCPClipboardFromGtk(std::string &data, std::string &drop_type) // IN
 {
-   DnDFileList fileList;
-   DynBuf buf;
-   uint64 totalSize = 0;
-   int64 size;
    bool ret = false;
 
    utf::string source = utf::string(data);
@@ -1674,6 +1780,8 @@ DnDUIX11::GetNextPath(utf::utf8string& str,     // IN: NUL-delimited path list
           ubyte == '*' ||   /* "Special significance within specific schemes" */
           ubyte == '!' ||   /* "Special significance within specific schemes" */
           ubyte == '%' ||   /* Escape character */
+          ubyte == '\r' ||  /* Ends an entry in a uri-list */
+          ubyte == '\n' ||  /* Ends an entry in a uri-list */
           ubyte >= 0x80) {  /* UTF-8 encoding bytes */
          str.replace(index, 1, "%");
          str.insert(index + 1, 1, Dec2Hex[ubyte >> 4]);

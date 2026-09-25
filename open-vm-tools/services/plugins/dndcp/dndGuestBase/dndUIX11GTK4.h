@@ -81,6 +81,8 @@ private:
    BuildFileContentURIList(utf::string& uriList,
                            utf::string pre,
                            utf::string post);
+   bool LocalFileListIsSafe(const DnDFileList &fList);
+   void LocalRefuseDrag(void);
    void LocalGetFileRequest(utf::string stagingDirName, const char *desktop);
    void LocalGetFileContentsRequest(const char *desktop);
    void LocalSetContentProvider(const char* desktop);
