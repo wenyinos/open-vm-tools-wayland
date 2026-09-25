@@ -110,6 +110,11 @@ libdndcp_la_SOURCES += dndUIX11.cpp
 libdndcp_la_SOURCES += dragDetWndX11.cpp
 endif
 
+if HAVE_WAYLAND
+libdndcp_la_CPPFLAGS += @WAYLAND_CFLAGS@
+libdndcp_la_LIBADD += @WAYLAND_LIBS@
+endif
+
 if LINUX
 libdndcp_la_CPPFLAGS += -I$(top_srcdir)/services/plugins/dndcp/fakeMouse
 libdndcp_la_SOURCES  += fakeMouseWayland/fakeMouseWayland.cpp
