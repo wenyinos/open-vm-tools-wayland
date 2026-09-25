@@ -189,6 +189,8 @@ private:
    bool mInHGDrag;
    // Flag to indicate if H->G drag has been triggered in guest by simulate mouse press
    bool mHGDragStarted;
+   /* A faked press is outstanding; it must not outlive the drag. */
+   bool mHGButtonDown;
    DND_DROPEFFECT mEffect;
    int32 mMousePosX;
    int32 mMousePosY;

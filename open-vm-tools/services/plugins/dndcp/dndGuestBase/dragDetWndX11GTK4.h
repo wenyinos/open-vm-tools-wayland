@@ -75,6 +75,7 @@ public:
                         const bool buttonPress, const bool moveWindow,
                         const bool coordsProvided,
                         const int xCoord, const int yCoord);
+   void RefreshScreenSize(void);
    void StartDrag(Glib::RefPtr<Gdk::ContentProvider> provider,
                   int mouseX,
                   int mouseY);

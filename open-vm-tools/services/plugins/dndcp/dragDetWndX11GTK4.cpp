@@ -102,15 +102,26 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
    if (useUInput_fd != -1) {
        g_debug("%s: Using uinput simulation", __FUNCTION__);
        Display *display = XOpenDisplay(NULL);
-       Screen * scrn = DefaultScreenOfDisplay(display);
-       if (FakeMouse_Init(useUInput_fd, scrn->width, scrn->height)) {
-           mUseUInput = true;
-           mScreenWidth = scrn->width;
-           mScreenHeight = scrn->height;
-           g_debug("%s: mScreenWidth is %d, mScreenHeight is %d", __FUNCTION__, mScreenWidth, mScreenHeight);
+
+       /*
+        * A compositor may start Xwayland on demand and stop it again when
+        * the last client goes, so there is not always a server to ask. The
+        * pointer then moves through XTest instead, which needs no screen
+        * size from here.
+        */
+       if (display != NULL) {
+           Screen * scrn = DefaultScreenOfDisplay(display);
+           if (FakeMouse_Init(useUInput_fd, scrn->width, scrn->height)) {
+               mUseUInput = true;
+               mScreenWidth = scrn->width;
+               mScreenHeight = scrn->height;
+               g_debug("%s: mScreenWidth is %d, mScreenHeight is %d", __FUNCTION__, mScreenWidth, mScreenHeight);
+           }
+           // Disconnect the connection to X Server.
+           XCloseDisplay(display);
+       } else {
+           g_warning("%s: no X display, uinput disabled\n", __FUNCTION__);
        }
-       // Disconnect the connection to X Server.
-       XCloseDisplay(display);
    }
 #endif
    return;
@@ -138,6 +149,61 @@ DragDetWnd::~DragDetWnd()
       delete mWnd;
       mWnd = NULL;
    }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DragDetWnd::RefreshScreenSize --
+ *
+ *    Update the uinput device after a change of screen size.
+ *
+ *    The device declares its absolute range when it is created, and
+ *    FakeMouse_Move() clamps to the size it was created with. After a
+ *    resolution change the range describes the old screen. The compositor
+ *    scales the old range onto the new output, and the clamp cuts off
+ *    coordinates beyond the old size. The GTK3 build checks the screen
+ *    size in DnDUIX11::OnSrcDragBegin() for the same reason.
+ *
+ *    This opens a fresh connection, because Xlib updates the screen size of
+ *    an open connection only for a client that processes RandR events itself.
+ *
+ * Side effects:
+ *    Recreates the uinput device if the size has changed. If that fails the
+ *    pointer goes back to XTest.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DragDetWnd::RefreshScreenSize(void)
+{
+#ifdef USE_UINPUT
+   Display *display;
+   Screen *scrn;
+
+   if (!mUseUInput) {
+      return;
+   }
+   display = XOpenDisplay(NULL);
+   if (display == NULL) {
+      return;
+   }
+   scrn = DefaultScreenOfDisplay(display);
+   if (scrn->width != mScreenWidth || scrn->height != mScreenHeight) {
+      g_debug("%s: screen is now %dx%d, was %dx%d\n", __FUNCTION__,
+              scrn->width, scrn->height, mScreenWidth, mScreenHeight);
+      if (FakeMouse_Update(scrn->width, scrn->height)) {
+         mScreenWidth = scrn->width;
+         mScreenHeight = scrn->height;
+      } else {
+         g_warning("%s: could not recreate the uinput device\n", __FUNCTION__);
+         mUseUInput = false;
+      }
+   }
+   XCloseDisplay(display);
+#endif
 }
 
 
@@ -984,6 +1050,10 @@ DragDetWnd::SimulateXEvents(const bool showWidget, const bool buttonEvent,
    /*
     * Generate mouse movements over the window.  The second one makes ungrabs
     * happen more reliably on KDE, but isn't necessary on GNOME.
+    *
+    * The coordinates may have come straight from the host. FakeMouse_Move()
+    * keeps them within the range of the uinput device, and the X server
+    * keeps a warp or an XTest motion on the screen.
     */
    if (mUseUInput) {
 #ifdef USE_UINPUT

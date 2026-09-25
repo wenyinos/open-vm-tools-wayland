@@ -43,6 +43,10 @@ static int uinput_fd = -1;
 // Indicates if the uinput device is created
 static bool isInit = false;
 
+// The screen the uinput device was told about, for clamping what it is given.
+static int screenWidth = 0;
+static int screenHeight = 0;
+
 /*
  *-----------------------------------------------------------------------------
  *
@@ -98,6 +102,8 @@ FakeMouse_Init(int fd,       // fd for uinput
    if (uinput_fd == -1) {
       return false;
    }
+   screenWidth = width;
+   screenHeight = height;
 
    /*
     * The uinput old interface is used for compatibility.
@@ -140,6 +146,26 @@ FakeMouse_Init(int fd,       // fd for uinput
    if (ioctl(uinput_fd, UI_SET_KEYBIT, BTN_LEFT) < 0) {
       g_debug("%s: Failed to register UI_SET_KEYBIT BTN_LEFT\n", __FUNCTION__);
       goto exit;
+   }
+
+   /*
+    * Without an INPUT_PROP_* bit, udev and libinput cannot tell what kind of
+    * device this is. The kernel also exposes it as a joystick:
+    *   N: Name="VMware DnD UInput pointer"
+    *   H: Handlers=mouse4 event7 js1
+    *   B: PROP=0
+    * libinput then misclassifies it, and that has broken other pointer
+    * features, such as the side buttons on a real mouse. The device reports
+    * absolute coordinates over the whole screen, so declare it a direct
+    * pointing device.
+    */
+   if (ioctl(uinput_fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT) < 0) {
+      g_debug("%s: Failed to register UI_SET_PROPBIT INPUT_PROP_DIRECT\n",
+              __FUNCTION__);
+   }
+   if (ioctl(uinput_fd, UI_SET_PROPBIT, INPUT_PROP_POINTER) < 0) {
+      g_debug("%s: Failed to register UI_SET_PROPBIT INPUT_PROP_POINTER\n",
+              __FUNCTION__);
    }
    if (ioctl(uinput_fd, UI_DEV_CREATE, 0) < 0) {
       g_debug("%s: Failed to create UInput device\n", __FUNCTION__);
@@ -249,6 +275,23 @@ FakeMouse_Move(int x,    // IN
 
    bool retValue = true;
    struct input_event event;
+
+   /*
+    * The coordinates can come straight from the host, and every uinput move
+    * comes through here. The device was declared with this range, and a
+    * compositor may do anything with a value outside it.
+    */
+   if (screenWidth > 0 && screenHeight > 0) {
+      int clampedX = MIN(MAX(x, 0), screenWidth - 1);
+      int clampedY = MIN(MAX(y, 0), screenHeight - 1);
+
+      if (clampedX != x || clampedY != y) {
+         g_debug("%s: clamping (%d, %d) to (%d, %d)\n", __FUNCTION__,
+                 x, y, clampedX, clampedY);
+         x = clampedX;
+         y = clampedY;
+      }
+   }
 
    event.type = EV_ABS;
    event.code = ABS_X;

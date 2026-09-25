@@ -77,6 +77,7 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
       mGHDnDInProgress(false),
       mGHDnDDataReceived(false),
       mInHGDrag(false),
+      mHGButtonDown(false),
       mEffect(DROP_NONE),
       mMousePosX(0),
       mMousePosY(0),
@@ -253,6 +254,26 @@ void
 DnDUIX11::ResetUI()
 {
    TRACE_CALL();
+   /*
+    * The press faked to start a host to guest drag is released by the host
+    * when it drops. If the drag never started there is nothing to drop, and
+    * a button left down through uinput holds the pointer in a drag for the
+    * whole session, which looks to the user like the desktop has frozen.
+    */
+   if (mHGButtonDown) {
+      /* The destructor deletes the detection window before it resets. */
+      if (mDetWnd != NULL) {
+         g_debug("%s: releasing the faked button\n", __FUNCTION__);
+         /*
+          * Release where the host has the pointer. The X server's idea of
+          * the pointer is stale while it is over a Wayland surface, and the
+          * host can still be dragging, so leave the window where it is.
+          */
+         mDetWnd->SimulateXEvents(false, true, false, false, true,
+                                  mMousePosX, mMousePosY);
+      }
+      mHGButtonDown = false;
+   }
    mGHDnDDataReceived = false;
    mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
    mGHDnDInProgress = false;
@@ -653,6 +674,9 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
    bool hasContent = false;
    mHGDragStarted = false;
 
+   /* The host's coordinates are for the screen as it is now. */
+   mDetWnd->RefreshScreenSize();
+
    /* Move detect window to the mouse in position */
    OnUpdateDetWnd(true, mOriginX, mOriginY);
 
@@ -781,6 +805,7 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
          mDetWnd->SimulateXEvents(true, true, false, true, true, x, y);
          // simulate drag mouse press
          mDetWnd->SimulateXEvents(false, true, true, false, true, x, y);
+         mHGButtonDown = true;
          // Tell Gtk that a drag should be started from this widget.
          mDetWnd->StartDrag(mProvider, x, y);
          mHGDragStarted = true;
@@ -827,6 +852,8 @@ DnDUIX11::OnSrcCancel()
    OnUpdateDetWnd(false, 0, 0);
    mDetWnd->SimulateXEvents(false, false, false, false, true,
                            mMousePosX, mMousePosY);
+   /* The real release has been sent; ResetUI() need not send another. */
+   mHGButtonDown = false;
    mInHGDrag = false;
    mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
    mEffect = DROP_NONE;
@@ -939,6 +966,8 @@ DnDUIX11::OnSrcDrop()
    mDetWnd->SimulateXEvents(false, true, false, false, true,
                             mMousePosX, mMousePosY);
    OnUpdateDetWnd(false, 0, 0);
+   /* The real release has been sent; ResetUI() need not send another. */
+   mHGButtonDown = false;
    /* We've successful or failure for HG drag, set the flag to false anyway */
    mInHGDrag = false;
 }
@@ -1037,6 +1066,7 @@ DnDUIX11::OnUpdateDetWnd(bool show,     // IN: show (true) or hide (false)
 void
 DnDUIX11::OnDestMoveDetWndToMousePos()
 {
+   mDetWnd->RefreshScreenSize();
    mDetWnd->SimulateXEvents(true, false, true, true, false, 0, 0);
 }
 
