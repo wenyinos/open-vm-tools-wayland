@@ -420,6 +420,10 @@ CopyPasteUIX11::LocalGetFileRequestCB(Gtk::SelectionData& sd,        // IN:
          sd.set(sd.get_target().c_str(), "");
          return;
       }
+#ifdef DND_IS_XDG
+      /* The clipboard hands out paths in here; keep it through a prune. */
+      DnD_SetClipboardStagingDir(hgStagingDir.c_str());
+#endif
       mHGGetFileStatus = DND_FILE_TRANSFER_IN_PROGRESS;
 
       mBlockAdded = false;
@@ -1204,6 +1208,14 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
       return;
    }
 
+#ifdef DND_IS_XDG
+   /*
+    * The host clip replaces any file list the clipboard offered. A clip with
+    * files records its staging directory again below.
+    */
+   DnD_SetClipboardStagingDir(NULL);
+#endif
+
    if (mBlockAdded) {
       mBlockAdded = false;
       if (DnD_BlockIsReady(mBlockCtrl)) {
@@ -1388,9 +1400,10 @@ CopyPasteUIX11::GetLocalFilesDone(bool success)
    mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
    if (success) {
       /*
-       * Mark current staging dir to be deleted on next reboot for FCP. The
-       * file will not be deleted after reboot if it is moved to another
-       * location by target application.
+       * Ask for the staging dir to be deleted on next reboot for FCP. On
+       * POSIX, File_UnlinkDelayed() unlinks at once and fails on a
+       * directory, so this removes nothing. DnD_CreateStagingDirectory()
+       * and start-up remove the dir once its transfer is over; see dndXdg.c.
        */
       DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
    } else {

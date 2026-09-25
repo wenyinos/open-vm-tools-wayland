@@ -1412,6 +1412,10 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
 
    if (CPClipboard_GetItem(&mClipboard, CPFORMAT_FILELIST, &buf, &sz)) {
       mHGStagingDir = utf::string(stagingDir.c_str());
+#ifdef DND_IS_XDG
+      /* Until OnGetFilesDone(), the prune must leave the directory alone. */
+      DnD_SetDragStagingDir(mHGStagingDir.c_str());
+#endif
 
       /* Provide path within vmblock file system instead of actual path. */
       stagingDirName = GetLastDirName(mHGStagingDir);
@@ -2711,6 +2715,10 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
     */
 
    mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
+#ifdef DND_IS_XDG
+   /* The files are written. Open files and the age rule protect them now. */
+   DnD_SetDragStagingDir(NULL);
+#endif
 
    /*
     * The host decides when this arrives, and the RPC layer does not check

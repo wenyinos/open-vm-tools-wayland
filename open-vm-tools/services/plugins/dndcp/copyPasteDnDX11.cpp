@@ -249,6 +249,10 @@ CopyPasteDnDX11::Init(ToolsAppCtx *ctx)
    if (wrapper) {
       BlockService::GetInstance()->Init(ctx);
    }
+#ifdef DND_IS_XDG
+   /* Remove staging directories whose transfers are over; see dndXdg.c. */
+   DnD_StartStagingPrune();
+#endif
 #ifdef GTK4
    gUserMainWidget = gtk_window_new();
    gtk_widget_set_visible(gUserMainWidget, FALSE);
@@ -280,6 +284,9 @@ CopyPasteDnDX11::Init(ToolsAppCtx *ctx)
 
 CopyPasteDnDX11::~CopyPasteDnDX11()
 {
+#ifdef DND_IS_XDG
+   DnD_StopStagingPrune();
+#endif
    delete m_copyPasteUI;
    delete m_dndUI;
 #if defined(GTK3)

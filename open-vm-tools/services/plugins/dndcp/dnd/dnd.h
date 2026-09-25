@@ -290,6 +290,13 @@ const char *DnD_GetFileRoot(void);
 char *DnD_CreateStagingDirectory(void);
 char *DnD_AppendPrefixToStagingDir(const char *oldName, const char *newName);
 Bool DnD_DeleteStagingFiles(const char *stagingDir, Bool onReboot);
+#ifdef DND_IS_XDG
+void DnD_SetClipboardStagingDir(const char *stagingDir);
+void DnD_SetDragStagingDir(const char *stagingDir);
+void DnD_PruneStagingDirectories(void);
+void DnD_StartStagingPrune(void);
+void DnD_StopStagingPrune(void);
+#endif
 Bool DnD_RemoveTempDirs(const char *dndTempDir, const char *prefix);
 int DnD_LegacyConvertToCPName(const char *nameIn,
                               size_t bufOutSize,

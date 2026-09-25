@@ -1044,6 +1044,14 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
       mLastHostClip = current;
    }
 
+#ifdef DND_IS_XDG
+   /*
+    * The host clip replaces any file list the clipboard offered. A clip with
+    * files records its staging directory again below.
+    */
+   DnD_SetClipboardStagingDir(NULL);
+#endif
+
    /*
     * The host clipboard has changed, whether or not the clip can be
     * installed here. Forget the earlier clips, so that a later guest copy
@@ -2496,6 +2504,10 @@ CopyPasteUIWayland::SetRemoteFileList(const CPClipboard *clip)  // IN
    }
    mHGStagingDir = stagingDir;
    free(stagingDir);
+#ifdef DND_IS_XDG
+   /* The clipboard offers these files from now on; keep them. */
+   DnD_SetClipboardStagingDir(mHGStagingDir.c_str());
+#endif
 
    mBlockAdded = mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
    if (!mBlockAdded) {
@@ -2671,6 +2683,9 @@ CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
        * Ask for the staging dir to be deleted on next reboot, as the X11
        * backends do. On POSIX, File_UnlinkDelayed() unlinks at once and
        * fails on a directory, so this removes nothing.
+       * DnD_CreateStagingDirectory() and start-up remove the dir once the
+       * clipboard no longer offers it and its transfer is over; see
+       * dndXdg.c.
        */
       DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
    } else {
@@ -2686,6 +2701,9 @@ CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
  *
  *    Send the guest selection read into mClipboard to the host.
  *
+ *    A new guest selection has replaced any host file list the clipboard
+ *    offered, so its staging directory no longer needs to outlive the prune.
+ *
  * Results:
  *    None.
  *
@@ -2698,6 +2716,9 @@ CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
 void
 CopyPasteUIWayland::SendLocalClip(void)
 {
+#ifdef DND_IS_XDG
+   DnD_SetClipboardStagingDir(NULL);
+#endif
    mCP->DestUISendClip(&mClipboard);
 }
 

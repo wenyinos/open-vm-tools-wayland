@@ -76,6 +76,9 @@ CopyPasteDnDWayland::CopyPasteDnDWayland()
 
 CopyPasteDnDWayland::~CopyPasteDnDWayland()
 {
+#ifdef DND_IS_XDG
+   DnD_StopStagingPrune();
+#endif
    if (m_copyPasteUI) {
       delete m_copyPasteUI;
       m_copyPasteUI = NULL;
@@ -165,6 +168,10 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
       g_debug("%s: vmblock %s (fd %d)\n", __FUNCTION__,
               DnD_BlockIsReady(&m_blockCtrl) ? "ready" : "unavailable",
               m_blockCtrl.fd);
+#ifdef DND_IS_XDG
+      /* Remove staging directories whose transfers are over; see dndXdg.c. */
+      DnD_StartStagingPrune();
+#endif
    }
 
    return TRUE;

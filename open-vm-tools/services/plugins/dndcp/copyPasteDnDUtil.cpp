@@ -107,7 +107,8 @@ LocalIsSafeStagingName(const char *name,     // IN: host supplied file name
  *      true if success, false otherwise.
  *
  * Side effects:
- *      None.
+ *      On success, records the staging directory as the one whose files the
+ *      clipboard offers, so that the prune in dndXdg.c keeps it.
  *
  *----------------------------------------------------------------------------
  */
@@ -290,6 +291,9 @@ LocalPrepareFileContents(const CPClipboard *clip,                       // IN
       }
    }
    g_debug("%s: created uri list\n", __FUNCTION__);
+#ifdef DND_IS_XDG
+   DnD_SetClipboardStagingDir(tempDir);
+#endif
    ret = true;
 
 exit:
