@@ -19,20 +19,18 @@
 /**
  * @file pointerPortal.h
  *
- *    Move and click the pointer through the XDG desktop portal.
+ *    Pointer integration under Wayland, through the RemoteDesktop portal and
+ *    libei.
  *
- *    A Wayland client cannot move the pointer itself: the protocol gives it no
- *    way to, and the compositor owns the cursor. The RemoteDesktop portal is
- *    the interface the desktop exposes for exactly this, and it is shared by
- *    every compositor that implements the portal, so one code path covers all
- *    of them.
+ *    A Wayland client cannot move the pointer or read its position: the
+ *    protocol gives it no way to, and the compositor owns both. The desktop
+ *    exposes them through the RemoteDesktop portal instead, which hands the
+ *    client an EIS socket that libei drives. That is the interface intended
+ *    for this, and it is shared by every compositor that implements the
+ *    portal, so one code path covers all of them.
  *
- *    The host needs two things from the guest pointer, and both are here:
- *
- *      - where the pointer is, which the host records so it can put the host
- *        cursor back in the right place when focus returns to it;
- *      - the ability to put the pointer somewhere, which is what a drag does
- *        when it repositions it over the drag detection window.
+ *    The portal asks the user to consent the first time, and the grant is
+ *    remembered per application afterwards.
  */
 
 #ifndef _POINTER_PORTAL_H_
@@ -45,40 +43,46 @@ extern "C" {
 #endif
 
 /*
- * Bring up a RemoteDesktop session that may move the pointer and inject
- * buttons. Returns FALSE when there is no session bus, no portal, the portal
- * has no RemoteDesktop interface, or the user refused the request. The caller
- * then keeps whatever it did before.
+ * The application id the plugin registers with the portal.
  *
- * The call drives the portal synchronously through a nested main loop, because
- * the caller runs on the main loop and has no place to yield. The portal shows
- * a dialog on the first call, so this can block for as long as the user takes
- * to answer it.
+ * The portal attributes a grant to this id, which is what lets the desktop
+ * remember a decision instead of asking at every login, and lets the user
+ * find and change it in the desktop's permission settings. It is deliberately
+ * not the id of any VMware product: the plugin is a separate application and
+ * its permissions are its own.
+ */
+#define POINTER_PORTAL_APP_ID "org.openvm.tools"
+
+/*
+ * Start a RemoteDesktop session that may move the pointer, and connect libei
+ * to it. Returns FALSE when there is no session bus, no portal, no
+ * RemoteDesktop interface, libei rejects the connection, or the user declined.
+ *
+ * The portal asks for consent on the first call, so this can block until the
+ * user answers. A caller that cannot wait should call it from an idle
+ * callback.
  */
 gboolean PointerPortal_Init(void);
 void PointerPortal_Exit(void);
 gboolean PointerPortal_IsAvailable(void);
 
 /*
- * The pointer position the portal last reported, in the coordinate space of
- * the host's pointer, or FALSE when no position is known yet.
- *
- * The portal does not report the position on request. It sends motion events
- * once the session is up, and this keeps the latest one.
+ * Whether the pointer device is ready to take events. The device appears
+ * asynchronously after Init(), and events sent before it is resumed are
+ * dropped by the compositor.
  */
-gboolean PointerPortal_GetPosition(int *x, int *y);
+gboolean PointerPortal_IsReady(void);
 
 /*
- * Whether the portal has ever delivered a pointer event. Until it has, its
- * notion of the position is not the host's, and a caller that records the
- * position for the host should wait.
+ * The bounds of the region the pointer moves in, in the same coordinate space
+ * MoveAbsolute() takes. Returns FALSE before the device is ready.
  */
-gboolean PointerPortal_HasPosition(void);
+gboolean PointerPortal_GetBounds(double *width, double *height);
 
 /*
- * Move the pointer. The portal takes absolute coordinates in its own stream's
- * coordinate space, so the caller passes the same space it reads back from
- * PointerPortal_GetPosition().
+ * Move the pointer. Coordinates are absolute, in the space reported by
+ * PointerPortal_GetBounds(). Events outside it are silently dropped by the
+ * compositor.
  */
 gboolean PointerPortal_MoveAbsolute(double x, double y);
 

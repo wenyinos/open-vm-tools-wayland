@@ -131,6 +131,28 @@ else
 libdndcp_la_SOURCES += waylandDrag/waylandDragStub.c
 endif
 
+if HAVE_LIBEI
+# Pointer integration through the RemoteDesktop portal, which needs libei to
+# drive the EIS socket the portal returns. See waylandPointer/pointerPortal.c.
+libdndcp_la_CPPFLAGS += @LIBEI_CFLAGS@
+libdndcp_la_LIBADD += @LIBEI_LIBS@
+libdndcp_la_SOURCES += waylandPointer/pointerPortal.c
+
+# The portal attributes a RemoteDesktop request to an application id, and that
+# id has to name an installed .desktop file. The plugin registers the id in
+# pointerPortal.c; this installs the file it refers to, which is also what
+# gives the user an entry to manage in the desktop's permission settings.
+portal_app_id = org.openvm.tools
+portal_desktop_file = $(portal_app_id).desktop
+portal_desktop_src = $(top_srcdir)/services/plugins/dndcp/$(portal_desktop_file).in
+
+applicationsdir = $(datadir)/applications
+applications_DATA = $(portal_desktop_file)
+
+$(portal_desktop_file): $(portal_desktop_src)
+	sed 's,_bindir_,$(bindir),' $(portal_desktop_src) > $@
+endif
+
 if LINUX
 libdndcp_la_CPPFLAGS += -I$(top_srcdir)/services/plugins/dndcp/fakeMouse
 libdndcp_la_SOURCES  += fakeMouseWayland/fakeMouseWayland.cpp
@@ -151,6 +173,9 @@ BUILT_SOURCES += cpFileContents_xdr.c
 
 CLEANFILES =
 CLEANFILES += $(BUILT_SOURCES)
+if HAVE_LIBEI
+CLEANFILES += $(portal_desktop_file)
+endif
 
 libdndcp_la_SOURCES += cpFileContents_xdr.c
 
@@ -209,3 +234,6 @@ endif
 
 EXTRA_DIST = waylandDrag/wlr-layer-shell-unstable-v1.xml
 EXTRA_DIST += waylandClipboard/wlr-data-control-unstable-v1.xml
+if HAVE_LIBEI
+EXTRA_DIST += $(portal_desktop_file).in
+endif

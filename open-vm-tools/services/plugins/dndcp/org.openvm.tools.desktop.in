@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=VMware Tools
+Comment=Desktop integration for VMware guests
+Exec=_bindir_/vmware-user-suid-wrapper
+NoDisplay=true
+
+# The pointer integration in a Wayland session asks the desktop for a
+# RemoteDesktop portal session, and the portal attributes the request to an
+# application id. That id has to name an installed .desktop file, and it is
+# this file. The id is deliberately not a VMware product name: this package is
+# its own application, and its permissions are its own.
+#
+# The desktop remembers the grant against this id, so the user is asked once
+# and can change the decision later in the desktop's permission settings.

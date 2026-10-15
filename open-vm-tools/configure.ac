@@ -1164,6 +1164,21 @@ if test "$have_wayland" = "yes"; then
       AC_MSG_ERROR([pkg-config did not report the wayland-scanner program or the wayland-protocols data directory.])
    fi
    AC_DEFINE([HAVE_WAYLAND], 1, [Define to 1 if building with native Wayland support.])
+
+   #
+   # Pointer integration in a Wayland session goes through the RemoteDesktop
+   # portal, which returns a socket that libei drives. Without libei the rest
+   # of the Wayland support still builds; only the pointer is left out.
+   #
+   PKG_CHECK_MODULES(
+      [LIBEI],
+      [libei-1.0],
+      [have_libei="yes"],
+      [have_libei="no"
+       AC_MSG_WARN([libei not found. Pointer integration in Wayland sessions will not be built. Install the libei development package to enable it.])])
+   if test "$have_libei" = "yes"; then
+      AC_DEFINE([HAVE_LIBEI], 1, [Define to 1 if libei is available for pointer integration.])
+   fi
 fi
 
 AC_CHECK_LIB(
@@ -1734,6 +1749,7 @@ AM_CONDITIONAL(HAVE_GNU_LD, test "$with_gnu_ld" = "yes")
 AM_CONDITIONAL(HAVE_GTK4,  test "$have_x" = "yes" && test "$with_gtk4" = "yes")
 AM_CONDITIONAL(HAVE_GTKMM,  test "$have_x" = "yes" && test "$have_gtkmm" = "yes")
 AM_CONDITIONAL(HAVE_WAYLAND, test "$have_wayland" = "yes")
+AM_CONDITIONAL(HAVE_LIBEI, test "$have_libei" = "yes")
 AM_CONDITIONAL(HAVE_PAM, test "$with_pam" = "yes")
 AM_CONDITIONAL(USE_SLASH_PROC, test "$os" = "linux")
 AM_CONDITIONAL(ENABLE_CONTAINERINFO, test "$enable_containerinfo" = "yes")

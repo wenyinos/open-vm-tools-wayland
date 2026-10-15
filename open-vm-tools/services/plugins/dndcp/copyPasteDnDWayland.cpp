@@ -33,6 +33,8 @@
 #include "copyPasteDnDWrapper.h"
 #include "copyPasteDnDWayland.h"
 #include "copyPasteUIWayland.h"
+#include "pointer.h"
+#include "tracer.hh"
 
 extern "C" {
 #include "dndCPMsgV4.h"
@@ -183,8 +185,10 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
  *
  * CopyPasteDnDWayland::PointerInit --
  *
- *    No-op on Wayland. Pointer_Init() works through the Xlib globals that
- *    CopyPasteDnDX11::Init() sets, and this backend leaves them unset.
+ *    Bring up pointer integration. The pointer loop itself reads and writes
+ *    the pointer through the Xlib globals on X11 and through the portal on
+ *    Wayland, so it is safe to run here: pointer.cpp checks the session type
+ *    before every X call.
  *
  *-----------------------------------------------------------------------------
  */
@@ -192,6 +196,16 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
 void
 CopyPasteDnDWayland::PointerInit()
 {
+   TRACE_CALL();
+
+   CopyPasteDnDWrapper *wrapper = CopyPasteDnDWrapper::GetInstance();
+
+   ASSERT(wrapper);
+
+   ToolsAppCtx *ctx = wrapper->GetToolsAppCtx();
+   ASSERT(ctx);
+
+   Pointer_Init(ctx);
 }
 
 

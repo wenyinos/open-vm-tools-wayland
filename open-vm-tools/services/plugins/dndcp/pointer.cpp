@@ -43,6 +43,10 @@ extern "C" {
 #include "vm_assert.h"
 #include "backdoor_def.h"
 
+#if defined(HAVE_WAYLAND) && defined(HAVE_LIBEI)
+#include "waylandPointer/pointerPortal.h"
+#endif
+
 extern "C" {
    #include "backdoor.h"
    #include "rpcvmx.h"
@@ -59,6 +63,23 @@ typedef enum {
 static Bool mouseIsGrabbed;
 static AbsoluteMouseState absoluteMouseState = ABSMOUSE_UNKNOWN;
 static uint8 gHostClipboardTries = 0;
+
+/*
+ * Whether this is a Wayland session. The X11 calls below work through the Xlib
+ * globals, which the Wayland backend leaves unset, so every one of them is
+ * skipped there and the portal is used instead.
+ */
+static Bool pointerUsesWayland(void)
+{
+#ifdef HAVE_WAYLAND
+   const char *type = g_getenv("XDG_SESSION_TYPE");
+
+   return g_getenv("WAYLAND_DISPLAY") != NULL &&
+          g_strcmp0(type, "x11") != 0;
+#else
+   return FALSE;
+#endif
+}
 
 #if defined(WIN32)
 extern BOOL vmx86WantsSelection;
@@ -125,13 +146,30 @@ PointerGetAbsoluteMouseState(void)
 void
 PointerGetXCursorPos(int *rootX, int *rootY)
 {
-   Window rootWin;
-   Window childWin;
-   int x;
-   int y;
-   unsigned int mask;
+#ifdef HAVE_WAYLAND
+   if (pointerUsesWayland()) {
+      /*
+       * A Wayland client cannot read the pointer position. The compositor
+       * owns the pointer and reports it only to the surface under it, and the
+       * portal does not expose it either. The host's own notion of the
+       * position, which PointerGetPos() reads, is what the caller actually
+       * needs, so report that and let the caller see no change.
+       *
+       * The values are left as the caller set them.
+       */
+      return;
+   }
+#endif
 
-   XQueryPointer(gXDisplay, gXRoot, &rootWin, &childWin, rootX, rootY, &x, &y, &mask);
+   {
+      Window rootWin;
+      Window childWin;
+      int x;
+      int y;
+      unsigned int mask;
+
+      XQueryPointer(gXDisplay, gXRoot, &rootWin, &childWin, rootX, rootY, &x, &y, &mask);
+   }
 }
 
 
@@ -140,7 +178,14 @@ PointerGetXCursorPos(int *rootX, int *rootY)
  *
  * PointerSetXCursorPos
  *
- *      Set the position in pixels of the X (mouse) pointer in the root window
+ *      Set the position in pixels of the X (mouse) pointer in the root window,
+ *      or, in a Wayland session, move the pointer through the portal.
+ *
+ *      The host tells us where the pointer should be when it grabs it. Under
+ *      X11 that is a warp; under Wayland a client cannot warp, so the move
+ *      goes to the portal, which is the interface the desktop exposes for it.
+ *      The portal is brought up on first use because it asks the user to
+ *      consent, and that is not worth doing unless a grab actually happens.
  *
  * Results:
  *      None.
@@ -154,6 +199,27 @@ PointerGetXCursorPos(int *rootX, int *rootY)
 void
 PointerSetXCursorPos(int x, int y)
 {
+#ifdef HAVE_WAYLAND
+   if (pointerUsesWayland()) {
+#if defined(HAVE_LIBEI)
+      if (!PointerPortal_IsAvailable()) {
+         if (!PointerPortal_Init()) {
+            g_debug("%s: no portal session, the pointer stays where it is\n",
+                    __FUNCTION__);
+            return;
+         }
+      }
+      if (!PointerPortal_MoveAbsolute(x, y)) {
+         g_debug("%s: the portal is not ready yet\n", __FUNCTION__);
+      }
+#else
+      g_debug("%s: built without libei, cannot move the pointer\n",
+              __FUNCTION__);
+#endif
+      return;
+   }
+#endif
+
    XWarpPointer(gXDisplay, None, gXRoot, 0, 0, 0, 0, x, y);
 }
 
