@@ -1,4 +1,15 @@
 # General
+
+> **Wayland support:** this branch carries a native Wayland backend, so desktop
+> integration (copy and paste, drag and drop, file transfer) works in a Wayland
+> session instead of only over XWayland. See **[docs/WAYLAND.md](docs/WAYLAND.md)**
+> for what works, which compositors are supported, how to build with
+> `--with-wayland`, and the known limits.
+>
+> **Wayland 支持：** 本分支包含原生 Wayland 后端，桌面集成（复制粘贴、拖放、文件传输）
+> 在 Wayland 会话下可用，而不再只能依赖 XWayland。功能范围、合成器支持情况、
+> `--with-wayland` 构建方式与已知限制请见 **[docs/WAYLAND.zh-CN.md](docs/WAYLAND.zh-CN.md)**。
+
 ## What is the open-vm-tools project?
 open-vm-tools is a set of services and modules that enable several features in VMware products for better management of, and seamless user interactions with, guests. It includes kernel modules for enhancing the performance of virtual machines running Linux or other VMware supported Unix like guest operating systems. 
  
