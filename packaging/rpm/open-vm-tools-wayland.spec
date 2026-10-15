@@ -20,6 +20,10 @@
 %global toolsdaemon  vmtoolsd
 %global vgauthdaemon vgauthd
 
+# The release carries installable packages only, so leave out the debuginfo and
+# debugsource packages the build would otherwise produce.
+%global debug_package %{nil}
+
 %{!?srcname:     %global srcname open-vm-tools-13.1.0-25218885}
 %{!?toolsversion: %global toolsversion 13.1.0}
 

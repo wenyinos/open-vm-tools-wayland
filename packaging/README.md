@@ -79,3 +79,8 @@ Output lands in `dist/<format>/`. `OVT_DEB_TAG=<tag>` folds a distribution tag
 into the DEB version, which is how the workflow keeps the three DEB builds from
 colliding on the release page; `OVT_NO_DEPS=1` skips the automatic dependency
 install.
+
+Only installable packages are produced. The `-debuginfo`, `-dbgsym` and
+`-debug` packages that the three toolchains generate by default are switched
+off, since the release is meant to carry something you can install rather than
+a set of symbols.

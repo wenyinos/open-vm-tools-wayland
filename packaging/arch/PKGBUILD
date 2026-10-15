@@ -18,6 +18,8 @@ arch=('x86_64')
 url='https://github.com/wenyinos/open-vm-tools-wayland'
 license=('LGPL-2.1-only' 'GPL-2.0-only')
 makedepends=('autoconf' 'automake' 'libtool' 'pkgconf' 'rpcsvc-proto' 'glib2-devel')
+# The release carries installable packages only, so leave out the -debug one.
+options=('!debug')
 _buildnumber=25218885
 _srcname="open-vm-tools-${pkgver}-${_buildnumber}"
 

@@ -97,7 +97,7 @@ jobs:
             dpkg-deb -f "$f" Package Version Architecture Provides Conflicts Replaces
           done
           echo "=== portal entry"
-          dpkg-deb -c dist/deb/*desktop*.deb \
+          dpkg-deb -c dist/deb/open-vm-tools-wayland-desktop_*.deb \
             | grep -E 'applications/|vmusr|vmware-user' || true
       - uses: actions/upload-artifact@v5
         with:

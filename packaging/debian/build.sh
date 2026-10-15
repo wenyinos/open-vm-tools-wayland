@@ -57,6 +57,8 @@ if [ "${OVT_NO_DEPS:-0}" != 1 ] && [ "$(id -u)" = 0 ] && command -v mk-build-dep
 		--tool 'apt-get -y --no-install-recommends' debian/control
 fi
 
-DEB_BUILD_OPTIONS="parallel=$(nproc)" dpkg-buildpackage -b -us -uc
+# noautodbgsym: the release carries installable packages only, so leave out the
+# -dbgsym packages dh_strip would otherwise produce.
+DEB_BUILD_OPTIONS="parallel=$(nproc) noautodbgsym" dpkg-buildpackage -b -us -uc
 
 find "$work" -maxdepth 1 -name '*.deb' -exec cp -v {} "$outdir/" \;
