@@ -146,12 +146,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           ls -l dist
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
+          # This job has no checkout, so name the repository rather than
+          # letting gh go looking for a git remote.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$REPO"
           else
             gh release create "$TAG" dist/* \
+              --repo "$REPO" \
               --title "open-vm-tools-wayland $TAG" \
               --generate-notes \
               --verify-tag
