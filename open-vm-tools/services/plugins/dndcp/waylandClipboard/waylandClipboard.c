@@ -33,7 +33,7 @@
 #define G_LOG_DOMAIN "dndcp"
 
 #include "waylandClipboard.h"
-#include "ext-data-control-v1-client-protocol.h"
+#include "wayland-data-control.h"
 
 #include <wayland-client.h>
 #include <glib-unix.h>
@@ -83,16 +83,22 @@ static struct {
    struct wl_display *display;
    struct wl_registry *registry;
    struct wl_seat *seat;
-   struct ext_data_control_manager_v1 *manager;
-   struct ext_data_control_device_v1 *device;
+   /*
+    * These are ext_data_control_* or zwlr_data_control_* depending on what
+    * the compositor offers, so they are kept as the proxies they are. Every
+    * call on them goes through wayland-data-control.h.
+    */
+   void *manager;
+   void *device;
+   const char *protoName;          /* For log messages. */
 
    /* What this client offers while it holds the selection. */
-   struct ext_data_control_source_v1 *source;
+   void *source;
    ClipItem *items;
    size_t nItems;
 
    /* What the current selection owner offers. */
-   struct ext_data_control_offer_v1 *offer;
+   void *offer;
    GPtrArray *offerTypes;          /* char *, owned by gClip.offer */
    guint64 selectionSerial;        /* Selection events seen. */
 
@@ -143,7 +149,7 @@ FreeItems(void)
 
 static void
 SourceSend(void *data,                                 // IN: unused
-           struct ext_data_control_source_v1 *source,  // IN
+           void *source,                               // IN
            const char *mimeType,                       // IN
            int32_t fd)                                 // IN
 {
@@ -261,18 +267,18 @@ SourceSend(void *data,                                 // IN: unused
  */
 
 static void
-SourceCancelled(void *data,                                // IN: unused
-                struct ext_data_control_source_v1 *source) // IN
+SourceCancelled(void *data,   // IN: unused
+                void *source) // IN
 {
    if (gClip.source == source) {
       gClip.source = NULL;
       FreeItems();
    }
-   ext_data_control_source_v1_destroy(source);
+   WaylandDataSourceDestroy(source);
 }
 
 
-static const struct ext_data_control_source_v1_listener gSourceListener = {
+static const WaylandDataSourceListener gSourceListener = {
    .send = SourceSend,
    .cancelled = SourceCancelled,
 };
@@ -294,16 +300,16 @@ static const struct ext_data_control_source_v1_listener gSourceListener = {
  */
 
 static void
-OfferType(void *data,                               // IN: unused
-          struct ext_data_control_offer_v1 *offer,  // IN
-          const char *mimeType)                     // IN
+OfferType(void *data,           // IN: unused
+          void *offer,          // IN
+          const char *mimeType) // IN
 {
    GPtrArray *types;
 
    if (offer == NULL || mimeType == NULL) {
       return;
    }
-   types = ext_data_control_offer_v1_get_user_data(offer);
+   types = WaylandDataOfferGetUserData(offer);
    if (types == NULL) {
       return;
    }
@@ -320,7 +326,7 @@ OfferType(void *data,                               // IN: unused
 }
 
 
-static const struct ext_data_control_offer_v1_listener gOfferListener = {
+static const WaylandDataOfferListener gOfferListener = {
    .offer = OfferType,
 };
 
@@ -340,42 +346,41 @@ static const struct ext_data_control_offer_v1_listener gOfferListener = {
  */
 
 static void
-OfferDestroy(struct ext_data_control_offer_v1 *offer)  // IN
+OfferDestroy(void *offer)  // IN
 {
    GPtrArray *types;
 
    if (offer == NULL) {
       return;
    }
-   types = ext_data_control_offer_v1_get_user_data(offer);
+   types = WaylandDataOfferGetUserData(offer);
    if (types != NULL) {
-      ext_data_control_offer_v1_set_user_data(offer, NULL);
+      WaylandDataOfferSetUserData(offer, NULL);
       g_ptr_array_free(types, TRUE);
    }
-   ext_data_control_offer_v1_destroy(offer);
+   WaylandDataOfferDestroy(offer);
 }
 
 
 static void
-DeviceDataOffer(void *data,                               // IN: unused
-                struct ext_data_control_device_v1 *device,// IN
-                struct ext_data_control_offer_v1 *offer)  // IN
+DeviceDataOffer(void *data,   // IN: unused
+                void *device, // IN
+                void *offer)  // IN
 {
    /*
     * The compositor is describing a new offer, and its types arrive next.
     * Add the listener before setting the user data, because adding a
     * listener also sets the proxy user data.
     */
-   ext_data_control_offer_v1_add_listener(offer, &gOfferListener, NULL);
-   ext_data_control_offer_v1_set_user_data(offer,
-                                           g_ptr_array_new_with_free_func(g_free));
+   WaylandDataOfferAddListener(offer, &gOfferListener, NULL);
+   WaylandDataOfferSetUserData(offer, g_ptr_array_new_with_free_func(g_free));
 }
 
 
 static void
-DeviceSelection(void *data,                                // IN: unused
-                struct ext_data_control_device_v1 *device, // IN
-                struct ext_data_control_offer_v1 *offer)   // IN
+DeviceSelection(void *data,   // IN: unused
+                void *device, // IN
+                void *offer)  // IN
 {
    if (gClip.offer != NULL && gClip.offer != offer) {
       gClip.offerTypes = NULL;
@@ -383,15 +388,15 @@ DeviceSelection(void *data,                                // IN: unused
    }
    gClip.offer = offer;
    gClip.offerTypes = offer != NULL ?
-      ext_data_control_offer_v1_get_user_data(offer) : NULL;
+      WaylandDataOfferGetUserData(offer) : NULL;
    gClip.selectionSerial++;
 }
 
 
 static void
-DevicePrimarySelection(void *data,                                // IN: unused
-                       struct ext_data_control_device_v1 *device, // IN
-                       struct ext_data_control_offer_v1 *offer)   // IN
+DevicePrimarySelection(void *data,   // IN: unused
+                       void *device, // IN
+                       void *offer)  // IN
 {
    /* The primary selection is not mirrored to the host. */
    if (offer != NULL && offer != gClip.offer) {
@@ -413,19 +418,19 @@ DevicePrimarySelection(void *data,                                // IN: unused
  */
 
 static void
-DeviceFinished(void *data,                                 // IN: unused
-               struct ext_data_control_device_v1 *device)  // IN
+DeviceFinished(void *data,   // IN: unused
+               void *device) // IN
 {
    g_debug("%s: the compositor finished the data device\n", __FUNCTION__);
    if (gClip.device != NULL) {
-      ext_data_control_device_v1_destroy(gClip.device);
+      WaylandDataControlDeviceDestroy(gClip.device);
       gClip.device = NULL;
    }
    gClip.inited = FALSE;
 }
 
 
-static const struct ext_data_control_device_v1_listener gDeviceListener = {
+static const WaylandDataDeviceListener gDeviceListener = {
    .data_offer = DeviceDataOffer,
    .selection = DeviceSelection,
    .finished = DeviceFinished,
@@ -440,10 +445,20 @@ RegistryGlobal(void *data,                  // IN: unused
                const char *iface,           // IN
                uint32_t version)            // IN
 {
-   if (strcmp(iface, ext_data_control_manager_v1_interface.name) == 0) {
-      gClip.manager = wl_registry_bind(registry, name,
-                                       &ext_data_control_manager_v1_interface,
-                                       1);
+   const WaylandDataControlProto *proto = WaylandDataControlMatch(iface);
+
+   if (proto != NULL) {
+      /*
+       * Keep the first protocol that answers. ext-data-control-v1 comes
+       * first in the list, so a compositor offering both is driven through
+       * the standard protocol.
+       */
+      if (gClip.manager == NULL) {
+         gClip.manager = WaylandDataControlBind(registry, name, proto, version);
+         if (gClip.manager != NULL) {
+            gClip.protoName = proto->name;
+         }
+      }
    } else if (strcmp(iface, wl_seat_interface.name) == 0 &&
               gClip.seat == NULL) {
       gClip.seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
@@ -542,23 +557,21 @@ WaylandClipboard_Init(void)
    wl_display_roundtrip(gClip.display);
 
    if (gClip.manager == NULL || gClip.seat == NULL) {
-      g_debug("%s: ext-data-control-v1 is not available\n", __FUNCTION__);
+      g_debug("%s: no data control protocol is available\n", __FUNCTION__);
       wl_display_disconnect(gClip.display);
       memset(&gClip, 0, sizeof gClip);
       return FALSE;
    }
 
-   gClip.device =
-      ext_data_control_manager_v1_get_data_device(gClip.manager, gClip.seat);
-   ext_data_control_device_v1_add_listener(gClip.device, &gDeviceListener,
-                                           NULL);
+   gClip.device = WaylandDataControlGetDevice(gClip.manager, gClip.seat);
+   WaylandDataControlDeviceAddListener(gClip.device, &gDeviceListener, NULL);
    wl_display_roundtrip(gClip.display);
 
    gClip.watch = g_unix_fd_add(wl_display_get_fd(gClip.display),
                                G_IO_IN | G_IO_HUP | G_IO_ERR,
                                DisplayReadable, NULL);
    gClip.inited = TRUE;
-   g_debug("%s: using ext-data-control-v1\n", __FUNCTION__);
+   g_debug("%s: using %s\n", __FUNCTION__, gClip.protoName);
 
    return TRUE;
 }
@@ -586,16 +599,16 @@ WaylandClipboard_Exit(void)
       g_source_remove(gClip.watch);
    }
    if (gClip.source != NULL) {
-      ext_data_control_source_v1_destroy(gClip.source);
+      WaylandDataSourceDestroy(gClip.source);
    }
    FreeItems();
    gClip.offerTypes = NULL;
    OfferDestroy(gClip.offer);
    if (gClip.device != NULL) {
-      ext_data_control_device_v1_destroy(gClip.device);
+      WaylandDataControlDeviceDestroy(gClip.device);
    }
    if (gClip.manager != NULL) {
-      ext_data_control_manager_v1_destroy(gClip.manager);
+      WaylandDataControlManagerDestroy(gClip.manager);
    }
    if (gClip.seat != NULL) {
       wl_seat_destroy(gClip.seat);
@@ -681,7 +694,7 @@ WaylandClipboard_Offer(const WaylandClipItem *items,  // IN
    }
 
    if (gClip.source != NULL) {
-      ext_data_control_source_v1_destroy(gClip.source);
+      WaylandDataSourceDestroy(gClip.source);
       gClip.source = NULL;
    }
    FreeItems();
@@ -697,14 +710,12 @@ WaylandClipboard_Offer(const WaylandClipItem *items,  // IN
    }
    gClip.nItems = nItems;
 
-   gClip.source =
-      ext_data_control_manager_v1_create_data_source(gClip.manager);
-   ext_data_control_source_v1_add_listener(gClip.source, &gSourceListener,
-                                           NULL);
+   gClip.source = WaylandDataControlCreateSource(gClip.manager);
+   WaylandDataSourceAddListener(gClip.source, &gSourceListener, NULL);
    for (i = 0; i < nItems; i++) {
-      ext_data_control_source_v1_offer(gClip.source, items[i].mimeType);
+      WaylandDataSourceOffer(gClip.source, items[i].mimeType);
    }
-   ext_data_control_device_v1_set_selection(gClip.device, gClip.source);
+   WaylandDataControlSetSelection(gClip.device, gClip.source);
    wl_display_flush(gClip.display);
 
    return TRUE;
@@ -783,7 +794,7 @@ WaylandClipboard_Receive(const char *mimeType,    // IN
       return NULL;
    }
 
-   ext_data_control_offer_v1_receive(gClip.offer, mimeType, fds[1]);
+   WaylandDataOfferReceive(gClip.offer, mimeType, fds[1]);
    wl_display_flush(gClip.display);
    close(fds[1]);
 
