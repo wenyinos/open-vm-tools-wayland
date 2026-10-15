@@ -144,6 +144,14 @@ chmod a-x %{buildroot}%{_udevrulesdir}/99-vmware-scsi-udev.rules
 # Static libtool archives are not packaged.
 find %{buildroot}%{_libdir} -name '*.la' -delete
 
+# No -dev package is shipped, so the headers, the pkg-config files and the
+# unversioned linker symlinks have nowhere to go.
+rm -rf %{buildroot}%{_includedir}/libDeployPkg %{buildroot}%{_includedir}/vmGuestLib
+rm -rf %{buildroot}%{_libdir}/pkgconfig
+rm -f %{buildroot}%{_libdir}/libDeployPkg.so %{buildroot}%{_libdir}/libguestlib.so \
+      %{buildroot}%{_libdir}/libguestStoreClient.so %{buildroot}%{_libdir}/libhgfs.so \
+      %{buildroot}%{_libdir}/libvgauth.so %{buildroot}%{_libdir}/libvmtools.so
+
 # The autostart entry has no use for the legacy Encoding key.
 sed -i 's|^Encoding.*$||g' %{buildroot}%{_sysconfdir}/xdg/autostart/vmware-user.desktop
 

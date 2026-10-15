@@ -45,20 +45,29 @@ cp "$here/vmtoolsd.pam" "$work/"
 
 echo "Building $srcname (version $version, build $build)"
 
+# Install what the build needs up front rather than letting makepkg -s resolve
+# the dependency lists. The desktop package depends on its sibling, which is
+# not in any repository while the split package is being built, and makepkg
+# cannot install that.
+if [ "${OVT_NO_DEPS:-0}" != 1 ] && command -v pacman >/dev/null 2>&1; then
+	pacman -S --noconfirm --needed --asdeps \
+		autoconf automake libtool pkgconf rpcsvc-proto \
+		glib2 gtk4 gtkmm-4.0 libdrm libmspack libtirpc openssl libxml2 xmlsec \
+		fuse3 pam libx11 libxext libxi libxinerama libxrandr libxrender \
+		libxtst libei wayland wayland-protocols
+fi
+
 if [ "$(id -u)" = 0 ]; then
 	builder=builder
 	if ! id -u "$builder" >/dev/null 2>&1; then
 		useradd -m "$builder"
-		# makepkg installs the dependencies it needs through sudo.
-		printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$builder" > /etc/sudoers.d/"$builder"
-		chmod 440 /etc/sudoers.d/"$builder"
 	fi
 	chown -R "$builder" "$work"
 	chmod 755 "$outdir"
-	su "$builder" -c "cd '$work' && makepkg -sf --noconfirm"
+	su "$builder" -c "cd '$work' && makepkg -f --noconfirm"
 else
 	cd "$work"
-	makepkg -sf --noconfirm
+	makepkg -f --noconfirm
 fi
 
 find "$work" -maxdepth 1 -name '*.pkg.tar.*' -exec cp -v {} "$outdir/" \;

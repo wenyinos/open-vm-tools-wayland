@@ -21,10 +21,12 @@ makedepends=('autoconf' 'automake' 'libtool' 'pkgconf' 'rpcsvc-proto')
 _buildnumber=25218885
 _srcname="open-vm-tools-${pkgver}-${_buildnumber}"
 
-_libs=('glib2' 'gtk4' 'gtkmm-4.0' 'libdrm' 'libmspack' 'libtirpc'
-        'openssl' 'libxml2' 'xmlsec' 'fuse3' 'pam' 'libx11' 'libxext' 'libxi'
-        'libxinerama' 'libxrandr' 'libxrender' 'libxtst' 'libei' 'wayland'
-        'wayland-protocols' 'pciutils' 'procps-ng' 'iproute2')
+# Read by makepkg from the top level, and inherited by the package function
+# that does not set its own depends.
+depends=('glib2' 'gtk4' 'gtkmm-4.0' 'libdrm' 'libmspack' 'libtirpc'
+         'openssl' 'libxml2' 'xmlsec' 'fuse3' 'pam' 'libx11' 'libxext' 'libxi'
+         'libxinerama' 'libxrandr' 'libxrender' 'libxtst' 'libei' 'wayland'
+         'wayland-protocols' 'pciutils' 'procps-ng' 'iproute2' 'coreutils' 'sed')
 
 # The systemd units and the PAM file are shared with the other packaging
 # formats, so packaging/arch/build.sh copies them next to this file.
@@ -61,7 +63,6 @@ build() {
 
 package_open-vm-tools-wayland() {
 	pkgdesc='Open Virtual Machine Tools for VMware guests, with native Wayland support'
-	depends=("${_libs[@]}" 'coreutils' 'sed')
 	provides=('open-vm-tools')
 	conflicts=('open-vm-tools')
 	install=open-vm-tools-wayland.install
@@ -97,7 +98,7 @@ package_open-vm-tools-wayland() {
 
 package_open-vm-tools-wayland-desktop() {
 	pkgdesc='Desktop integration plugins for open-vm-tools-wayland'
-	depends=("open-vm-tools-wayland=$pkgver-$pkgrel" "${_libs[@]}")
+	depends=("open-vm-tools-wayland=$pkgver-$pkgrel")
 	provides=('open-vm-tools-desktop')
 	conflicts=('open-vm-tools-desktop')
 	install=open-vm-tools-wayland-desktop.install

@@ -22,5 +22,5 @@ usr/lib/*/libvmtools.so.*
 usr/lib/*/open-vm-tools/plugins/common
 usr/lib/*/open-vm-tools/plugins/vmsvc
 usr/lib/*/open-vm-tools/serviceDiscovery
-usr/lib/udev/rules.d/99-vmware-scsi-udev.rules
+lib/udev/rules.d/99-vmware-scsi-udev.rules
 usr/share/open-vm-tools
