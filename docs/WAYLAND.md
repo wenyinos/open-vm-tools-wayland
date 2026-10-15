@@ -34,7 +34,10 @@ work in both directions in a Wayland session, without falling back to an X11 ses
 
 The clipboard backend offers every format the host sent at once, so one copy
 carries RTF and plain text together: pasting rich text into a plain text editor
-yields text, and into a rich text editor keeps the formatting.
+yields text, and into a rich text editor keeps the formatting. When the host
+sends **only** rich text, as AbiWord does, a plain text rendering is derived
+from it and offered too, so an application that takes only plain text has
+something to paste.
 
 ## Pointer integration
 
@@ -254,25 +257,23 @@ These come from the inherited patch set and are not resolved:
 - **Display scaling offsets a drag.** If the VMware window scales the guest display,
   a host to guest drag lands beside the host pointer. Use a guest resolution that
   fits the window (View → Autosize → Autofit Guest).
-- **Dropped files expire after two minutes.** An application that reads a dropped
-  file more than two minutes after the drop, such as a browser upload form, finds
-  it gone. Drop into a file manager first.
 - **Tiling compositors stretch the detection window.** Float the window titled
   `vmware-user`, for example in sway: `for_window [title="vmware-user"] floating enable`.
-- **Format details.** A clipboard carrying only RTF pastes only into applications
-  that accept RTF, and `:` in a host-supplied file name is rewritten to `^%`
-  (a Windows host limitation).
+- **`:` in a host-supplied file name is rewritten to `^%`** (a Windows host
+  limitation).
 - **Pasted files keep the permissions the host reports**, so a read-only file
   arrives read-only (upstream behaviour).
 - **A kernel-side resolution issue remains.** When the host logs
   `guestScreens not congruent with hostScreens`, it may be `vmwgfx` not updating
   active screen positions after `DRM_VMW_UPDATE_LAYOUT`, which is a kernel driver
   matter.
-- **The drag timings are measured values.** If a compositor needs different
-  ones a drag can start late or be refused; they can be adjusted in the `[dnd]`
-  section of `tools.conf` (see below) without a rebuild.
+- **The drag timings and the staging age are both adjustable.** If a compositor
+  needs different timings a drag can start late or be refused, and an
+  application that takes longer to open a dropped file than the staging age
+  allows finds it gone; both are set in the `[dnd]` section of `tools.conf` (see
+  below) without a rebuild.
 
-## Drag timing adjustments
+## Drag timing and staging adjustments
 
 Each step of a drag waits for the step before it, and the waits were measured on
 the compositors the feature was tested with. What a compositor needs varies, so
@@ -289,8 +290,10 @@ they can be adjusted in the `[dnd]` section of `/etc/vmware-tools/tools.conf`:
 #waylandDragAcceptTimeoutMs=500
 # How long a bridged XDND drop waits for the target to accept.
 #xdndDropAcceptTimeoutMs=1500
+# How long a dropped or pasted file stays available, from its last change.
+#stagingPruneAgeSec=120
 ```
 
 A value that is not a positive number is refused and the default is used, so a
-typo cannot turn a wait into a busy loop. With nothing set the behaviour is
-unchanged.
+typo cannot turn a wait into a busy loop or delete a staging directory while its
+transfer is still running. With nothing set the behaviour is unchanged.
