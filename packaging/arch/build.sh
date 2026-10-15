@@ -51,7 +51,7 @@ echo "Building $srcname (version $version, build $build)"
 # cannot install that.
 if [ "${OVT_NO_DEPS:-0}" != 1 ] && command -v pacman >/dev/null 2>&1; then
 	pacman -S --noconfirm --needed --asdeps \
-		autoconf automake libtool pkgconf rpcsvc-proto \
+		autoconf automake libtool pkgconf rpcsvc-proto glib2-devel \
 		glib2 gtk4 gtkmm-4.0 libdrm libmspack libtirpc openssl libxml2 xmlsec \
 		fuse3 pam libx11 libxext libxi libxinerama libxrandr libxrender \
 		libxtst libei wayland wayland-protocols

@@ -37,14 +37,14 @@ jobs:
         run: |
           dnf install -y git tar gzip
           git config --global --add safe.directory '*'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False rpm-build dnf-plugins-core
           dnf builddep -y packaging/rpm/open-vm-tools-wayland.spec
       - name: Build packages
         run: packaging/rpm/build.sh "$PWD/dist/rpm"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: rpm-fedora-${{ matrix.distro }}
           path: dist/rpm/*.rpm
@@ -70,7 +70,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates tar gzip
           git config --global --add safe.directory '*'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install packaging tools
         run: apt-get install -y --no-install-recommends devscripts equivs fakeroot
       # The tag lands in the package version, so the builds for the three
@@ -79,7 +79,7 @@ jobs:
         env:
           OVT_DEB_TAG: ${{ matrix.tag }}
         run: packaging/debian/build.sh "$PWD/dist/deb"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: deb-${{ matrix.tag }}
           path: dist/deb/*.deb
@@ -94,10 +94,10 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed git
           git config --global --add safe.directory '*'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build packages
         run: packaging/arch/build.sh "$PWD/dist/arch"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: arch
           path: dist/arch/*.pkg.tar.zst
@@ -109,7 +109,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true

@@ -17,7 +17,7 @@ pkgdesc='Open Virtual Machine Tools for VMware guests, with native Wayland suppo
 arch=('x86_64')
 url='https://github.com/wenyinos/open-vm-tools-wayland'
 license=('LGPL-2.1-only' 'GPL-2.0-only')
-makedepends=('autoconf' 'automake' 'libtool' 'pkgconf' 'rpcsvc-proto')
+makedepends=('autoconf' 'automake' 'libtool' 'pkgconf' 'rpcsvc-proto' 'glib2-devel')
 _buildnumber=25218885
 _srcname="open-vm-tools-${pkgver}-${_buildnumber}"
 
@@ -125,5 +125,5 @@ package_open-vm-tools-wayland-desktop() {
 	find "$pkgdir" -name '*.la' -delete
 
 	chmod 4755 "$pkgdir/usr/bin/vmware-user-suid-wrapper"
-	sed -i 's|^Encoding.*$||g' "$pkgdir/etc/xdg/autostart/vmware-user.desktop"
+	sed -i '/^Encoding/d' "$pkgdir/etc/xdg/autostart/vmware-user.desktop"
 }

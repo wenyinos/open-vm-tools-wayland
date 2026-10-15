@@ -44,7 +44,7 @@ override_dh_auto_install:
 		debian/tmp/lib/udev/rules.d/99-vmware-scsi-udev.rules
 
 	# The autostart entry has no use for the legacy Encoding key.
-	sed -i 's|^Encoding.*$||g' \
+	sed -i '/^Encoding/d' \
 		debian/tmp/etc/xdg/autostart/vmware-user.desktop
 
 override_dh_installsystemd:

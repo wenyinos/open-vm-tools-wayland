@@ -153,7 +153,7 @@ rm -f %{buildroot}%{_libdir}/libDeployPkg.so %{buildroot}%{_libdir}/libguestlib.
       %{buildroot}%{_libdir}/libvgauth.so %{buildroot}%{_libdir}/libvmtools.so
 
 # The autostart entry has no use for the legacy Encoding key.
-sed -i 's|^Encoding.*$||g' %{buildroot}%{_sysconfdir}/xdg/autostart/vmware-user.desktop
+sed -i '/^Encoding/d' %{buildroot}%{_sysconfdir}/xdg/autostart/vmware-user.desktop
 
 install -p -m 644 -D %{SOURCE1} %{buildroot}%{_unitdir}/%{toolsdaemon}.service
 install -p -m 644 -D %{SOURCE2} %{buildroot}%{_unitdir}/%{vgauthdaemon}.service
