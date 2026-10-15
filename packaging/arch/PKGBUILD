@@ -1,0 +1,128 @@
+# Maintainer: Wenyin Root <wenyinos@users.noreply.github.com>
+#
+# Arch packaging for the open-vm-tools Wayland fork.
+#
+# The package carries its own name and declares conflicts with open-vm-tools,
+# so pacman removes the distribution package before installing this one. The
+# two cannot be installed side by side.
+#
+# packaging/arch/build.sh generates the source tarball, rewrites pkgver and
+# _buildnumber to match the tree, and runs makepkg.
+
+pkgbase=open-vm-tools-wayland
+pkgname=('open-vm-tools-wayland' 'open-vm-tools-wayland-desktop')
+pkgver=13.1.0
+pkgrel=1
+pkgdesc='Open Virtual Machine Tools for VMware guests, with native Wayland support'
+arch=('x86_64')
+url='https://github.com/wenyinos/open-vm-tools-wayland'
+license=('LGPL-2.1-only' 'GPL-2.0-only')
+makedepends=('autoconf' 'automake' 'libtool' 'pkgconf' 'rpcsvc-proto')
+_buildnumber=25218885
+_srcname="open-vm-tools-${pkgver}-${_buildnumber}"
+
+_libs=('glib2' 'gtk4' 'gtkmm-4.0' 'libdrm' 'libmspack' 'libtirpc'
+        'openssl' 'libxml2' 'xmlsec' 'fuse3' 'pam' 'libx11' 'libxext' 'libxi'
+        'libxinerama' 'libxrandr' 'libxrender' 'libxtst' 'libei' 'wayland'
+        'wayland-protocols' 'pciutils' 'procps-ng' 'iproute2')
+
+# The systemd units and the PAM file are shared with the other packaging
+# formats, so packaging/arch/build.sh copies them next to this file.
+source=("${_srcname}.tar.gz" 'vmtoolsd.service' 'vgauthd.service'
+        'open-vm-tools.conf' 'vmtoolsd.pam' 'run-vmblock\x2dfuse.mount')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+prepare() {
+	cd "$srcdir/$_srcname"
+	autoreconf -vif
+}
+
+build() {
+	cd "$srcdir/$_srcname"
+	./configure \
+		--prefix=/usr \
+		--libdir=/usr/lib \
+		--sysconfdir=/etc \
+		--localstatedir=/var \
+		--disable-static \
+		--disable-docs \
+		--enable-resolutionkms \
+		--enable-servicediscovery \
+		--enable-vmwgfxctrl \
+		--with-fuse \
+		--with-gtk4 \
+		--with-tirpc \
+		--with-wayland \
+		--with-xmlsec1 \
+		--without-kernel-modules
+
+	make
+}
+
+package_open-vm-tools-wayland() {
+	pkgdesc='Open Virtual Machine Tools for VMware guests, with native Wayland support'
+	depends=("${_libs[@]}" 'coreutils' 'sed')
+	provides=('open-vm-tools')
+	conflicts=('open-vm-tools')
+	install=open-vm-tools-wayland.install
+	backup=('etc/pam.d/vmtoolsd' 'etc/vmware-tools/vgauth.conf'
+	        'etc/modules-load.d/open-vm-tools.conf')
+
+	cd "$srcdir/$_srcname"
+	make DESTDIR="$pkgdir" install
+
+	install -Dm644 "$srcdir/vmtoolsd.service" \
+		"$pkgdir/usr/lib/systemd/system/vmtoolsd.service"
+	install -Dm644 "$srcdir/vgauthd.service" \
+		"$pkgdir/usr/lib/systemd/system/vgauthd.service"
+	install -Dm644 "$srcdir/open-vm-tools.conf" \
+		"$pkgdir/usr/lib/modules-load.d/open-vm-tools.conf"
+	install -Dm644 "$srcdir/vmtoolsd.pam" "$pkgdir/etc/pam.d/vmtoolsd"
+
+	# The desktop plugins and the suid wrapper live in the other package.
+	rm -rf "$pkgdir/usr/lib/open-vm-tools/plugins/vmusr"
+	rm -f "$pkgdir/usr/bin/vmware-user" "$pkgdir/usr/bin/vmwgfxctrl" \
+		"$pkgdir/usr/bin/vmware-user-suid-wrapper" \
+		"$pkgdir/usr/bin/vmware-vmblock-fuse"
+	rm -rf "$pkgdir/etc/xdg" "$pkgdir/usr/share/applications"
+
+	# No -dev package is shipped.
+	rm -rf "$pkgdir/usr/include" "$pkgdir/usr/lib/pkgconfig"
+	find "$pkgdir" -name '*.la' -delete
+
+	chmod a-x "$pkgdir/etc/pam.d/vmtoolsd" "$pkgdir/etc/vmware-tools/"*.conf \
+		"$pkgdir/etc/vmware-tools/vgauth/schemas/"* \
+		"$pkgdir/usr/lib/udev/rules.d/99-vmware-scsi-udev.rules"
+}
+
+package_open-vm-tools-wayland-desktop() {
+	pkgdesc='Desktop integration plugins for open-vm-tools-wayland'
+	depends=("open-vm-tools-wayland=$pkgver-$pkgrel" "${_libs[@]}")
+	provides=('open-vm-tools-desktop')
+	conflicts=('open-vm-tools-desktop')
+	install=open-vm-tools-wayland-desktop.install
+
+	cd "$srcdir/$_srcname"
+	make DESTDIR="$pkgdir" install
+
+	install -Dm644 "$srcdir/run-vmblock\\x2dfuse.mount" \
+		"$pkgdir/usr/lib/systemd/system/run-vmblock\\x2dfuse.mount"
+
+	# Keep only what belongs to this package.
+	local path
+	for path in usr/bin/VGAuthService usr/bin/vm-support usr/bin/vmhgfs-fuse \
+		usr/bin/vmtoolsd usr/bin/vmware-alias-import usr/bin/vmware-checkvm \
+		usr/bin/vmware-hgfsclient usr/bin/vmware-namespace-cmd \
+		usr/bin/vmware-rpctool usr/bin/vmware-toolbox-cmd \
+		usr/bin/vmware-vgauth-cmd usr/bin/vmware-vgauth-smoketest \
+		usr/bin/vmware-xferlogs usr/lib/open-vm-tools/plugins/common \
+		usr/lib/open-vm-tools/plugins/vmsvc usr/lib/open-vm-tools/serviceDiscovery \
+		usr/share/open-vm-tools usr/lib/udev etc/pam.d etc/vmware-tools \
+		usr/include usr/lib/pkgconfig; do
+		rm -rf "$pkgdir/$path"
+	done
+	find "$pkgdir" -name '*.la' -delete
+
+	chmod 4755 "$pkgdir/usr/bin/vmware-user-suid-wrapper"
+	sed -i 's|^Encoding.*$||g' "$pkgdir/etc/xdg/autostart/vmware-user.desktop"
+}

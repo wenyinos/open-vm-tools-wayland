@@ -1,0 +1,76 @@
+Source: open-vm-tools-wayland
+Section: admin
+Priority: optional
+Maintainer: Wenyin Root <wenyinos@users.noreply.github.com>
+Build-Depends:
+ autoconf,
+ automake,
+ debhelper-compat (= 13),
+ libdrm-dev,
+ libei-dev,
+ libfuse3-dev,
+ libglib2.0-dev,
+ libgtk-4-dev,
+ libgtkmm-4.0-dev,
+ libltdl-dev,
+ libmspack-dev,
+ libpam0g-dev,
+ libssl-dev,
+ libtirpc-dev,
+ libudev-dev,
+ libwayland-dev,
+ libx11-dev,
+ libxext-dev,
+ libxi-dev,
+ libxinerama-dev,
+ libxrandr-dev,
+ libxrender-dev,
+ libxtst-dev,
+ libxmlsec1-dev,
+ libtool,
+ pkg-config,
+ rpcsvc-proto,
+ wayland-protocols (>= 1.39)
+Standards-Version: 4.6.2
+Homepage: https://github.com/wenyinos/open-vm-tools-wayland
+Rules-Requires-Root: binary-targets
+
+Package: open-vm-tools-wayland
+Architecture: amd64
+Provides: open-vm-tools
+Conflicts: open-vm-tools
+Replaces: open-vm-tools
+Depends:
+ coreutils,
+ iproute2,
+ pciutils,
+ procps,
+ sed,
+ ${misc:Depends},
+ ${shlibs:Depends}
+Description: Open Virtual Machine Tools for VMware guests, with native Wayland support
+ open-vm-tools supplies the guest-side drivers and agents that let a VMware
+ guest report its status to the host, synchronise its clock, resize its
+ display, and share the clipboard and dragged files with the host.
+ .
+ This build is the upstream 13.1.0 release plus the Wayland work: clipboard
+ and drag-and-drop over the Wayland data-control protocols, and pointer
+ integration through the XDG RemoteDesktop portal and libei. The X11 paths are
+ unchanged and are still used in an X11 session.
+ .
+ It installs the same binaries and plugins as the distribution package, so it
+ replaces it rather than living beside it.
+
+Package: open-vm-tools-wayland-desktop
+Architecture: amd64
+Depends:
+ open-vm-tools-wayland (= ${binary:Version}),
+ ${misc:Depends},
+ ${shlibs:Depends}
+Provides: open-vm-tools-desktop
+Conflicts: open-vm-tools-desktop
+Replaces: open-vm-tools-desktop
+Description: Desktop integration plugins for open-vm-tools-wayland
+ The per-user plugins that run inside the desktop session: clipboard and
+ drag-and-drop, automatic display resizing, and the VMware tools autostart
+ entry. Install this on a guest with a graphical session.

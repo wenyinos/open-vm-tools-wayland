@@ -1,0 +1,4 @@
+#%PAM-1.0
+# Used by VGAuthService when it authenticates a guest user.
+auth       include      system-auth
+account    include      system-auth

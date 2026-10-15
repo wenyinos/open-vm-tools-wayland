@@ -1,0 +1,122 @@
+name: Build and release packages
+
+# Pushing a v* tag builds the RPM, DEB and Pacman packages and attaches them to
+# a release for that tag. workflow_dispatch runs the same builds without
+# publishing, which is useful for checking a change before tagging.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rpm:
+    name: RPM (Fedora ${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ['44', '45']
+    steps:
+      # The container images are minimal, so git has to exist before checkout.
+      - name: Install git
+        run: dnf install -y git tar gzip
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False rpm-build dnf-plugins-core
+          dnf builddep -y packaging/rpm/open-vm-tools-wayland.spec
+      - name: Build packages
+        run: packaging/rpm/build.sh "$PWD/dist/rpm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-fedora-${{ matrix.distro }}
+          path: dist/rpm/*.rpm
+          if-no-files-found: error
+
+  deb:
+    name: DEB (${{ matrix.tag }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:13
+            tag: debian13
+          - image: ubuntu:24.04
+            tag: ubuntu2404
+          - image: ubuntu:26.04
+            tag: ubuntu2604
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates tar gzip
+      - uses: actions/checkout@v4
+      - name: Install packaging tools
+        run: apt-get install -y --no-install-recommends devscripts equivs
+      # The tag lands in the package version, so the builds for the three
+      # distributions get distinct names on the release page.
+      - name: Build packages
+        env:
+          OVT_DEB_TAG: ${{ matrix.tag }}
+        run: packaging/debian/build.sh "$PWD/dist/deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.tag }}
+          path: dist/deb/*.deb
+          if-no-files-found: error
+
+  arch:
+    name: Pacman (Arch)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install git
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v4
+      - name: Build packages
+        run: packaging/arch/build.sh "$PWD/dist/arch"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [rpm, deb, arch]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "open-vm-tools-wayland $TAG" \
+              --generate-notes \
+              --verify-tag
+          fi

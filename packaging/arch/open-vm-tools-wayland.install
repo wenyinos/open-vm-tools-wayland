@@ -1,0 +1,25 @@
+post_install() {
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	if systemd-detect-virt 2>/dev/null | grep -qi vmware; then
+		systemctl enable vgauthd.service vmtoolsd.service >/dev/null 2>&1 || true
+	fi
+}
+
+post_upgrade() {
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	if systemd-detect-virt 2>/dev/null | grep -qi vmware; then
+		systemctl enable vgauthd.service vmtoolsd.service >/dev/null 2>&1 || true
+	fi
+}
+
+pre_remove() {
+	if [ -x /usr/bin/vmware-checkvm ] && /usr/bin/vmware-checkvm >/dev/null 2>&1; then
+		# Tell the host that the tools are going away.
+		/usr/bin/vmware-rpctool 'tools.set.version 0' >/dev/null 2>&1 || true
+	fi
+	systemctl disable vgauthd.service vmtoolsd.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+	systemctl daemon-reload >/dev/null 2>&1 || true
+}

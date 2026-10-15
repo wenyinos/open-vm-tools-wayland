@@ -1,0 +1,9 @@
+etc/xdg/autostart/vmware-user.desktop
+usr/bin/vmware-user
+usr/bin/vmwgfxctrl
+usr/bin/vmware-user-suid-wrapper
+usr/bin/vmware-vmblock-fuse
+usr/lib/*/open-vm-tools/plugins/vmusr
+# The RemoteDesktop portal resolves the app id used by the pointer
+# integration to this entry, so the integration cannot work without it.
+usr/share/applications/org.openvm.tools.desktop

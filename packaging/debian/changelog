@@ -1,0 +1,11 @@
+open-vm-tools-wayland (13.1.0) unstable; urgency=medium
+
+  * Package open-vm-tools 13.1.0 with the Wayland work: clipboard and
+    drag-and-drop over the Wayland data-control protocols, and pointer
+    integration through the XDG RemoteDesktop portal and libei.
+  * Carry the fixes for upstream issues #800 (GTK4 clipboard size) and
+    #805 (resolutionSet claiming the resolution server role).
+  * Provides, Conflicts and Replaces open-vm-tools, so the distribution
+    package is removed when this one is installed.
+
+ -- Wenyin Root <wenyinos@users.noreply.github.com>  Thu, 15 Oct 2026 13:37:56 +0000

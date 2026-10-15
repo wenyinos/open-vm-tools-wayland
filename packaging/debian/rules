@@ -1,0 +1,54 @@
+#!/usr/bin/make -f
+#
+# debian/rules for the open-vm-tools Wayland fork.
+#
+# packaging/debian/build.sh copies this directory into the unpacked source
+# tree as debian/ and runs dpkg-buildpackage there.
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+		--disable-static \
+		--disable-docs \
+		--enable-resolutionkms \
+		--enable-servicediscovery \
+		--enable-vmwgfxctrl \
+		--with-fuse \
+		--with-gtk4 \
+		--with-tirpc \
+		--with-wayland \
+		--with-xmlsec1 \
+		--without-kernel-modules
+
+override_dh_auto_install:
+	dh_auto_install
+
+	# No -dev package is shipped, so the headers, the pkg-config files and
+	# the libtool archives have nowhere to go.
+	rm -rf debian/tmp/usr/include debian/tmp/usr/lib/*/pkgconfig
+	find debian/tmp -name '*.la' -delete
+
+	# The tree ships a portable PAM file whose modules do not exist on
+	# Debian; substitute the distribution one.
+	install -m 0644 debian/open-vm-tools-wayland.pam \
+		debian/tmp/etc/pam.d/vmtoolsd
+
+	chmod a-x debian/tmp/etc/pam.d/vmtoolsd \
+		debian/tmp/etc/vmware-tools/*.conf \
+		debian/tmp/etc/vmware-tools/vgauth/schemas/* \
+		debian/tmp/usr/lib/udev/rules.d/99-vmware-scsi-udev.rules
+
+	# The autostart entry has no use for the legacy Encoding key.
+	sed -i 's|^Encoding.*$||g' \
+		debian/tmp/etc/xdg/autostart/vmware-user.desktop
+
+override_dh_installsystemd:
+	dh_installsystemd --name=vmtoolsd --restart-after-upgrade
+	dh_installsystemd --name=vgauthd --restart-after-upgrade
+	dh_installsystemd --name='run-vmblock\x2dfuse'
+
+override_dh_fixperms:
+	dh_fixperms
+	chmod 4755 debian/open-vm-tools-wayland-desktop/usr/bin/vmware-user-suid-wrapper
