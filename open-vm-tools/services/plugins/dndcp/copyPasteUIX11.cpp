@@ -83,6 +83,7 @@
 #include "dnd.h"
 #include "dndMsg.h"
 #include "copyPasteDnDUtil.h"
+#include "rtfToText/rtfToText.h"
 
 extern "C" {
    #include "dndClipboard.h"
@@ -1270,6 +1271,34 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
          mHGTextData = utf::string(reinterpret_cast<char *>(buf),
                                    STRING_ENCODING_UTF8);
          mIsClipboardOwner = true;
+      } else if (!mHGRTFData.empty()) {
+         /*
+          * The host sent rich text with no plain rendering next to it, as
+          * AbiWord does. Render one so that an application taking only plain
+          * text has something to paste; the rich text stays on offer beside
+          * it.
+          */
+         size_t derivedLen = 0;
+         gchar *derived = RtfToText(mHGRTFData.data(), mHGRTFData.size(),
+                                    &derivedLen);
+
+         if (derived != NULL) {
+            Gtk::TargetEntry stringText(TARGET_NAME_STRING);
+            Gtk::TargetEntry plainText(TARGET_NAME_TEXT_PLAIN);
+            Gtk::TargetEntry utf8Text(TARGET_NAME_UTF8_STRING);
+            Gtk::TargetEntry compountText(TARGET_NAME_COMPOUND_TEXT);
+
+            targets.push_back(stringText);
+            targets.push_back(plainText);
+            targets.push_back(utf8Text);
+            targets.push_back(compountText);
+            mHGTextData = utf::string(derived, STRING_ENCODING_UTF8);
+            mIsClipboardOwner = true;
+            g_debug("%s: no plain text from the host, rendered %"
+                    G_GSIZE_FORMAT " bytes from the RTF\n", __FUNCTION__,
+                    (gsize) derivedLen);
+            g_free(derived);
+         }
       }
 
       refClipboard->set(targets,

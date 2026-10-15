@@ -47,6 +47,7 @@
 
 #include "vmware.h"
 #include "copyPasteUIWayland.h"
+#include "rtfToText/rtfToText.h"
 #include "waylandClipboard.h"
 #include "copyPasteDnDUtil.h"
 #include "guestDnDCPMgr.hh"
@@ -1114,6 +1115,8 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
    size_t imgSz = 0;
    const char *text = NULL;
    gsize textLen = 0;
+   gchar *derivedText = NULL;   /* Text rendered from the RTF, when used. */
+   size_t derivedLen = 0;
    bool haveImg = false;
    bool haveRtf = false;
 
@@ -1142,6 +1145,26 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
       items.push_back({ "text/plain;charset=utf-8", text, textLen });
       items.push_back({ "text/plain", text, textLen });
       items.push_back({ "UTF8_STRING", text, textLen });
+   } else if (haveRtf) {
+      /*
+       * The host sent rich text with no plain rendering next to it, which is
+       * what AbiWord does. Without the fallback below, an application that
+       * takes only plain text has nothing to paste. Offer a rendering of the
+       * rich text for those applications, next to the rich text itself.
+       */
+      gchar *derived = RtfToText((const char *) rtfBuf, rtfSz, &derivedLen);
+
+      if (derived != NULL) {
+         derivedText = derived;
+         text = derivedText;
+         textLen = derivedLen;
+         items.push_back({ "text/plain;charset=utf-8", text, textLen });
+         items.push_back({ "text/plain", text, textLen });
+         items.push_back({ "UTF8_STRING", text, textLen });
+         g_debug("%s: no plain text from the host, rendered %"
+                 G_GSIZE_FORMAT " bytes from the RTF\n", __FUNCTION__,
+                 (gsize) textLen);
+      }
    }
 
    if (items.empty()) {
@@ -1162,6 +1185,7 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
 
    if (!ok) {
       g_warning("%s: could not install the local selection\n", __FUNCTION__);
+      g_free(derivedText);
       return;
    }
 
@@ -1179,6 +1203,9 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
    if (text != NULL) {
       mLastClipboardText.assign(text, textLen);
    }
+
+   /* The offer copies what it needs; see waylandClipboard.h. */
+   g_free(derivedText);
 }
 
 

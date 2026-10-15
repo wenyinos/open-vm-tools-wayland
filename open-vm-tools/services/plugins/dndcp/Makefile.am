@@ -100,6 +100,9 @@ libdndcp_la_SOURCES += copyPasteCompat.c
 libdndcp_la_SOURCES += vmCopyPasteDnDWrapper.cpp
 libdndcp_la_SOURCES += copyPasteDnDX11.cpp
 libdndcp_la_SOURCES += copyPasteDnDUtil.cpp
+# Renders rich text as plain text, for a host clip that carries only rich
+# text. Used by all three copy and paste backends.
+libdndcp_la_SOURCES += rtfToText/rtfToText.c
 if HAVE_GTK4
 libdndcp_la_SOURCES += copyPasteCompatX11GTK4.c
 libdndcp_la_SOURCES += copyPasteUIX11GTK4.cpp

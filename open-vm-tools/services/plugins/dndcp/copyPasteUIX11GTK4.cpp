@@ -63,6 +63,7 @@
 #include "dndMsg.h"
 #include "dndPluginIntX11.h"
 #include "copyPasteDnDUtil.h"
+#include "rtfToText/rtfToText.h"
 #include <gtk/gtk.h>
 #include <sys/time.h>
 
@@ -1441,10 +1442,15 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
       Glib::RefPtr<Gdk::ContentProvider> providerUnion;
       Glib::RefPtr<Glib::Bytes> textData;
       Glib::RefPtr<Glib::Bytes> rtfData;
+      Glib::RefPtr<Glib::Bytes> derivedData;
+      void *rtfBuf = NULL;
+      size_t rtfSz = 0;
 
       if (CPClipboard_GetItem(clip, CPFORMAT_RTF, &buf, &sz)) {
          g_debug("%s: RTF data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
 	 rtfData = Glib::Bytes::create(buf, sz);
+	 rtfBuf = buf;
+	 rtfSz = sz;
 	 provider.push_back(Gdk::ContentProvider::create(TARGET_NAME_APPLICATION_RTF, rtfData));
 	 provider.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_RICHTEXT, rtfData));
 	 provider.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_RTF, rtfData));
@@ -1455,6 +1461,25 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
 	 textData = Glib::Bytes::create(buf, sz);
 	 provider.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN, textData));
 	 provider.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN_UTF8, textData));
+      } else if (rtfBuf != NULL) {
+         /*
+          * The host sent rich text with no plain rendering next to it, as
+          * AbiWord does. Render one so that an application taking only plain
+          * text has something to paste; the rich text stays on offer beside
+          * it.
+          */
+         size_t derivedLen = 0;
+         gchar *derived = RtfToText((const char *) rtfBuf, rtfSz, &derivedLen);
+
+         if (derived != NULL) {
+            derivedData = Glib::Bytes::create(derived, derivedLen);
+            g_free(derived);
+            provider.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN, derivedData));
+            provider.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN_UTF8, derivedData));
+            g_debug("%s: no plain text from the host, rendered %"
+                    G_GSIZE_FORMAT " bytes from the RTF\n", __FUNCTION__,
+                    (gsize) derivedLen);
+         }
       }
 
       providerUnion = Gdk::ContentProvider::create(provider);
