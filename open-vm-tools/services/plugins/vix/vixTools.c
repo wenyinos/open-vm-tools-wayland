@@ -928,7 +928,7 @@ VixToolsBuildUserEnvironmentTable(const char * const *envp)   // IN: optional
       char *whereToSplit;
       size_t nameLen;
 
-      whereToSplit = strchr(*envp, '=');
+      whereToSplit = (char *)strchr(*envp, '=');
       if (NULL == whereToSplit) {
          /* Our code generated this list, so this shouldn't happen. */
          ASSERT(0);

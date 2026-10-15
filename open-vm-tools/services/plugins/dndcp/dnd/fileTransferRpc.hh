@@ -38,8 +38,8 @@ class LIB_EXPORT FileTransferRpc
 public:
    virtual ~FileTransferRpc(void) {};
 
-   sigc::signal<void, uint32, const uint8 *, size_t> HgfsPacketReceived;
-   sigc::signal<void, uint32, const uint8 *, size_t> HgfsReplyReceived;
+   sigc::signal<void(uint32, const uint8 *, size_t)> HgfsPacketReceived;
+   sigc::signal<void(uint32, const uint8 *, size_t)> HgfsReplyReceived;
 
    virtual void Init(void) = 0;
    virtual bool SendHgfsPacket(uint32 sessionId,

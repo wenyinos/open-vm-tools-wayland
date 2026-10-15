@@ -73,18 +73,18 @@ public:
                ToolsAppCtx *ctx);
    virtual ~GuestDnDMgr(void);
 
-   sigc::signal<void, int, int> moveMouseChanged;
-   sigc::signal<void, bool, int, int> updateDetWndChanged;
-   sigc::signal<void, GUEST_DND_STATE> stateChanged;
+   sigc::signal<void(int, int)> moveMouseChanged;
+   sigc::signal<void(bool, int, int)> updateDetWndChanged;
+   sigc::signal<void(GUEST_DND_STATE)> stateChanged;
 
-   sigc::signal<void, const CPClipboard*, std::string> srcDragBeginChanged;
-   sigc::signal<void> srcDropChanged;
-   sigc::signal<void> srcCancelChanged;
-   sigc::signal<void, bool> getFilesDoneChanged;
+   sigc::signal<void(const CPClipboard*, std::string)> srcDragBeginChanged;
+   sigc::signal<void()> srcDropChanged;
+   sigc::signal<void()> srcCancelChanged;
+   sigc::signal<void(bool)> getFilesDoneChanged;
 
-   sigc::signal<void> destCancelChanged;
-   sigc::signal<void, int32, int32> privDropChanged;
-   sigc::signal<void> destMoveDetWndToMousePosChanged;
+   sigc::signal<void()> destCancelChanged;
+   sigc::signal<void(int32, int32)> privDropChanged;
+   sigc::signal<void()> destMoveDetWndToMousePosChanged;
 
    GuestDnDSrc *GetDnDSrc(void) { return mSrc; }
    GuestDnDDest *GetDnDDest(void) { return mDest; }

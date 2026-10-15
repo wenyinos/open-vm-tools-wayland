@@ -42,14 +42,14 @@ namespace xutils {
 
 
 /* Actual definitions of the signals in this class. */
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > currentDesktopChanged;
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > desktopLayoutChanged;
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > desktopGeometryChanged;
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > desktopViewportChanged;
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > windowStackChanged;
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > windowManagerChanged;
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > activeWindowChanged;
-sigc::signal<void, Glib::RefPtr<Gdk::Screen> > workAreaChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> currentDesktopChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> desktopLayoutChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> desktopGeometryChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> desktopViewportChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> windowStackChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> windowManagerChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> activeWindowChanged;
+sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> workAreaChanged;
 
 /* Necessary for calculating per-monitor _NET_WORKAREA in GetMonitorWorkArea() */
 struct NETWMStrutPartial {

@@ -39,18 +39,18 @@ public:
    virtual ~CopyPasteRpc(void) {};
 
    /* sigc signals for CopyPaste source callback. */
-   sigc::signal<void, uint32, bool, const CPClipboard*> srcRecvClipChanged;
-   sigc::signal<void, uint32, const uint8 *, uint32> requestFilesChanged;
-   sigc::signal<void, uint32, bool, const uint8 *, uint32> getFilesDoneChanged;
+   sigc::signal<void(uint32, bool, const CPClipboard*)> srcRecvClipChanged;
+   sigc::signal<void(uint32, const uint8 *, uint32)> requestFilesChanged;
+   sigc::signal<void(uint32, bool, const uint8 *, uint32)> getFilesDoneChanged;
 
    /* sigc signal for CopyPaste destination callback. */
-   sigc::signal<void, uint32, bool> destRequestClipChanged;
+   sigc::signal<void(uint32, bool)> destRequestClipChanged;
 
    /* sigc signal for ping reply callback. */
-   sigc::signal<void, uint32> pingReplyChanged;
+   sigc::signal<void(uint32)> pingReplyChanged;
 
    /* sigc signal for rpc command reply received. */
-   sigc::signal<void, uint32, uint32> cmdReplyChanged;
+   sigc::signal<void(uint32, uint32)> cmdReplyChanged;
 
    virtual void Init(void) = 0;
    virtual void SendPing(uint32 caps) = 0;

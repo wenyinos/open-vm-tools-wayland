@@ -266,7 +266,7 @@ IpEntryMatchesDevice(const char *devName,
    char *p;
    size_t n;
 
-   if ((p = strchr(label, ':')) != NULL) {
+   if ((p = (char *)strchr(label, ':')) != NULL) {
       n = p - label;
    } else {
       n = strlen(label);

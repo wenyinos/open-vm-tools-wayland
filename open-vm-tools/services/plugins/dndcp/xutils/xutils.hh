@@ -65,22 +65,22 @@ uint32 GetDesktopForWindow(Glib::RefPtr<const Gdk::Window> window);
 
 uint32 GetNumDesktops(Glib::RefPtr<Gdk::Screen> screen);
 uint32 GetCurrentDesktop(Glib::RefPtr<Gdk::Screen> screen);
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > currentDesktopChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> currentDesktopChanged;
 
 bool GetDesktopLayout(Glib::RefPtr<Gdk::Screen> screen,
                       uint32& rows, uint32& columns, Gtk::CornerType& corner,
                       Gtk::Orientation& orientation);
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > desktopLayoutChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> desktopLayoutChanged;
 
 bool GetDesktopGeometry(Glib::RefPtr<Gdk::Screen> screen,
                         uint32& width, uint32& height);
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > desktopGeometryChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> desktopGeometryChanged;
 
 bool GetDesktopViewport(Glib::RefPtr<Gdk::Screen> screen,
                         uint32 desktopIndex, VMPoint& viewport);
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > desktopViewportChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> desktopViewportChanged;
 
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > activeWindowChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> activeWindowChanged;
 
 /* Window stacking */
 void RaiseWindow(Glib::RefPtr<Gdk::Window> window,
@@ -88,7 +88,7 @@ void RaiseWindow(Glib::RefPtr<Gdk::Window> window,
                     Glib::RefPtr<Gdk::Window>(),
                  guint32 timestamp = 0);
 HostWindowList GetHostWindowStack();
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > windowStackChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> windowStackChanged;
 
 
 /* Multi-head */
@@ -96,7 +96,7 @@ void GetMonitorWorkArea(Glib::RefPtr<Gdk::Screen> screen,
                         int monitor, Gdk::Rectangle& rect);
 
 utf::string GetWindowManagerName(Glib::RefPtr<Gdk::Screen> screen);
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > windowManagerChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> windowManagerChanged;
 
 void SetFullscreenMonitorsHint(Glib::RefPtr<Gdk::Window> window,
                                std::vector<long> topology);
@@ -109,7 +109,7 @@ void GetPointerLocation(const Glib::RefPtr<Gdk::Window>& window,
                         int& x, int& y, Gdk::ModifierType& mask);
 
 
-extern sigc::signal<void, Glib::RefPtr<Gdk::Screen> > workAreaChanged;
+extern sigc::signal<void(Glib::RefPtr<Gdk::Screen>)> workAreaChanged;
 
 bool GetXWindowSize(const Glib::RefPtr<Gdk::Window>& window, int& width,
                     int& height);

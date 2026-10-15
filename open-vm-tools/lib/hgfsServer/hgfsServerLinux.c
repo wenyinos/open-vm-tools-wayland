@@ -1369,7 +1369,7 @@ HgfsGetHiddenAttr(char const *fileName,         // IN:  Input filename
    ASSERT(fileName);
    ASSERT(attr);
 
-   baseName = strrchr(fileName, DIRSEPC);
+   baseName = (char *)strrchr(fileName, DIRSEPC);
 
    if ((baseName != NULL) &&
        (baseName[1] == '.') &&

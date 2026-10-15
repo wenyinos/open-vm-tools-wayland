@@ -48,9 +48,9 @@ public:
    GuestCopyPasteMgr(DnDCPTransport *transport);
    ~GuestCopyPasteMgr(void);
 
-   sigc::signal<void, const CPClipboard*> srcRecvClipChanged;
-   sigc::signal<void> destRequestClipChanged;
-   sigc::signal<void, bool> getFilesDoneChanged;
+   sigc::signal<void(const CPClipboard*)> srcRecvClipChanged;
+   sigc::signal<void()> destRequestClipChanged;
+   sigc::signal<void(bool)> getFilesDoneChanged;
 
    GUEST_CP_STATE GetState(void) { return mCPState; }
    void SetState(GUEST_CP_STATE state);

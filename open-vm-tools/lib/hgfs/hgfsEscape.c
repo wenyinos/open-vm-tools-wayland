@@ -198,7 +198,7 @@ HgfsAddEscapeCharacter(char const * bufIn,      // IN: input name
       if (outputSpace < 2) {
          return FALSE;
       }
-      illegal = strchr(HGFS_ILLEGAL_CHARS, bufIn[escapeContext->processedOffset]);
+      illegal = (char *)strchr(HGFS_ILLEGAL_CHARS, bufIn[escapeContext->processedOffset]);
       escapeContext->processedOffset++;  // Skip illegal input character
       ASSERT(illegal != NULL);
       escapeContext->outputBuffer[escapeContext->outputOffset] =
@@ -583,12 +583,12 @@ HgfsIsEscapeSequence(char const *bufIn,   // IN: input name
          if (bufIn[offset - 2] == HGFS_ESCAPE_SUBSTITUE_CHAR) {
             return TRUE;
          }
-         substitute = strchr(HGFS_SUBSTITUTE_CHARS, bufIn[offset - 2]);
+         substitute = (char *)strchr(HGFS_SUBSTITUTE_CHARS, bufIn[offset - 2]);
          if (substitute != NULL) {
             return TRUE;
          }
       }
-      substitute = strchr(HGFS_SUBSTITUTE_CHARS, bufIn[offset - 1]);
+      substitute = (char *)strchr(HGFS_SUBSTITUTE_CHARS, bufIn[offset - 1]);
       if (substitute != NULL) {
          return TRUE;
       }
@@ -887,7 +887,7 @@ HgfsEscapeUndoComponent(char   *bufIn,             // IN: Characters to be unesc
       size_t offset = escapePointer - bufIn;
 
       if (HgfsIsEscapeSequence(bufIn, offset, sizeIn)) {
-         char* substitute = strchr(HGFS_SUBSTITUTE_CHARS, bufIn[offset - 1]);
+         char* substitute = (char *)strchr(HGFS_SUBSTITUTE_CHARS, bufIn[offset - 1]);
          if (substitute != NULL) {
             bufIn[offset - 1] = HGFS_ILLEGAL_CHARS[substitute - HGFS_SUBSTITUTE_CHARS];
          } else if (bufIn[offset - 1] == HGFS_ESCAPE_SUBSTITUE_CHAR) {

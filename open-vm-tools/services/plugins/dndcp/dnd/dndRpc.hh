@@ -40,30 +40,30 @@ public:
    virtual ~DnDRpc(void) {};
 
    /* sigc signals for DnD source callback. */
-   sigc::signal<void, uint32, const CPClipboard *> srcDragBeginChanged;
-   sigc::signal<void, uint32> srcCancelChanged;
-   sigc::signal<void, uint32, uint32, uint32> srcDropChanged;
+   sigc::signal<void(uint32, const CPClipboard *)> srcDragBeginChanged;
+   sigc::signal<void(uint32)> srcCancelChanged;
+   sigc::signal<void(uint32, uint32, uint32)> srcDropChanged;
 
    /* sigc signals for DnD destination callback. */
-   sigc::signal<void, uint32, int32> destDragEnterReplyChanged;
-   sigc::signal<void, uint32> destPrivDragEnterChanged;
-   sigc::signal<void, uint32, int32, int32> destPrivDragLeaveChanged;
-   sigc::signal<void, uint32, int32, int32> destPrivDropChanged;
-   sigc::signal<void, uint32, int32, int32> destDropChanged;
-   sigc::signal<void, uint32> destCancelChanged;
+   sigc::signal<void(uint32, int32)> destDragEnterReplyChanged;
+   sigc::signal<void(uint32)> destPrivDragEnterChanged;
+   sigc::signal<void(uint32, int32, int32)> destPrivDragLeaveChanged;
+   sigc::signal<void(uint32, int32, int32)> destPrivDropChanged;
+   sigc::signal<void(uint32, int32, int32)> destDropChanged;
+   sigc::signal<void(uint32)> destCancelChanged;
 
-   sigc::signal<void, uint32, int32, int32> moveMouseChanged;
-   sigc::signal<void, uint32, uint32> updateFeedbackChanged;
-   sigc::signal<void, uint32, int32, int32> queryExitingChanged;
-   sigc::signal<void, uint32> dragNotPendingChanged;
-   sigc::signal<void, uint32, const uint8 *, uint32> requestFileChanged;
-   sigc::signal<void, uint32, bool, const uint8 *, uint32> getFilesDoneChanged;
+   sigc::signal<void(uint32, int32, int32)> moveMouseChanged;
+   sigc::signal<void(uint32, uint32)> updateFeedbackChanged;
+   sigc::signal<void(uint32, int32, int32)> queryExitingChanged;
+   sigc::signal<void(uint32)> dragNotPendingChanged;
+   sigc::signal<void(uint32, const uint8 *, uint32)> requestFileChanged;
+   sigc::signal<void(uint32, bool, const uint8 *, uint32)> getFilesDoneChanged;
 
    /* sigc signal for responding to ping reply */
-   sigc::signal<void, uint32> pingReplyChanged;
+   sigc::signal<void(uint32)> pingReplyChanged;
 
    /* sigc signal for rpc cmd reply received. */
-   sigc::signal<void, uint32, uint32> cmdReplyChanged;
+   sigc::signal<void(uint32, uint32)> cmdReplyChanged;
 
    /* DnD source. */
    virtual bool SrcDragBeginDone(uint32 sessionId) = 0;

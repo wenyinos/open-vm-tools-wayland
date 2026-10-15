@@ -1467,7 +1467,7 @@ StrUtil_ReplaceAll(const char *orig, // IN
     lenWith = strlen(with);
 
     current = orig;
-    while ((tmp = strstr(current, what)) != NULL) {
+    while ((tmp = (char *)strstr(current, what)) != NULL) {
        current = tmp + lenWhat;
        ++occurrences;
     }
@@ -1705,7 +1705,7 @@ StrUtilHasListItem(char const *list,                               // IN:
    do {
       int tokenLen;
 
-      foundDelim = strchr(list, delim);
+      foundDelim = (char *)strchr(list, delim);
       if (foundDelim == NULL) { // either single or last element
          tokenLen = strlen(list);
       } else { // ! last element
