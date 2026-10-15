@@ -248,6 +248,12 @@ private:
 
    void UpdateWorkArea();
 
+   /*
+    * Read one drag timing from the [dnd] section of tools.conf, falling back
+    * to the given default when it is not set.
+    */
+   int LocalTiming(const char *key, int defaultMs);
+
    ToolsAppCtx *mCtx;
    GuestDnDMgr *mDnD;
    utf::string mHGStagingDir;
@@ -259,6 +265,18 @@ private:
    bool mBlockAdded;
    /* The path the current block was added on, which RemoveBlock() removes. */
    utf::string mBlockedPath;
+
+   /*
+    * How long each step of a drag may take, in milliseconds. They come from
+    * the [dnd] section of tools.conf when it sets them, and otherwise hold
+    * the values that were measured to work. They are configurable because the
+    * time a compositor needs varies, and a compositor that needs a longer
+    * wait than the default should not require a rebuild. See LocalTiming().
+    */
+   int mXdndLeaveDelayMs;
+   int mXdndDragBeginTimeoutMs;
+   int mWaylandDragAcceptTimeoutMs;
+   int mXdndDropAcceptTimeoutMs;
 
    /* State to determine if drag motion is a drag enter. */
    bool mGHDnDInProgress;

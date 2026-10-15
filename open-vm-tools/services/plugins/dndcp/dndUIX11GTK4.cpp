@@ -285,11 +285,84 @@ DnDUIX11::~DnDUIX11()
  *-----------------------------------------------------------------------------
  */
 
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::LocalTiming --
+ *
+ *    Read one drag timing from the [dnd] section of tools.conf.
+ *
+ *    The value is a number of milliseconds. Anything that is not a positive
+ *    number is ignored and the default is used, so a typo cannot turn a wait
+ *    into a busy loop.
+ *
+ * Results:
+ *    The configured value, or defaultMs.
+ *
+ * Side effects:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+int
+DnDUIX11::LocalTiming(const char *key,     // IN: key in the [dnd] section
+                      int defaultMs)       // IN: value to use without one
+{
+   GError *err = NULL;
+   int value = defaultMs;
+
+   if (mCtx != NULL && mCtx->config != NULL) {
+      value = g_key_file_get_integer(mCtx->config, "dnd", key, &err);
+      if (err != NULL) {
+         /* Not set, which is the normal case; keep the default. */
+         g_clear_error(&err);
+         value = defaultMs;
+      } else if (value <= 0) {
+         g_warning("%s: [dnd] %s is not a positive number of milliseconds, "
+                   "using %d\n", __FUNCTION__, key, defaultMs);
+         value = defaultMs;
+      } else {
+         g_debug("%s: [dnd] %s = %d ms\n", __FUNCTION__, key, value);
+      }
+   }
+
+   return value;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIX11::Init --
+ *
+ * Results:
+ *    TRUE on success.
+ *
+ * Side effects:
+ *    None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
 bool
 DnDUIX11::Init()
 {
    TRACE_CALL();
    bool ret = true;
+
+   /*
+    * Read the drag timings before anything can use them. Each falls back to
+    * the measured default when tools.conf does not set it.
+    */
+   mXdndLeaveDelayMs =
+      LocalTiming("xdndLeaveDelayMs", XDND_LEAVE_DELAY_MS);
+   mXdndDragBeginTimeoutMs =
+      LocalTiming("xdndDragBeginTimeoutMs", XDND_DRAG_BEGIN_TIMEOUT_MS);
+   mWaylandDragAcceptTimeoutMs =
+      LocalTiming("waylandDragAcceptTimeoutMs", WAYLAND_DRAG_ACCEPT_TIMEOUT_MS);
+   mXdndDropAcceptTimeoutMs =
+      LocalTiming("xdndDropAcceptTimeoutMs", XDND_DROP_ACCEPT_TIMEOUT_MS);
 
    CPClipboard_Init(&mClipboard);
 
@@ -700,7 +773,7 @@ DnDUIX11::OnXdndBeginTimeout(gpointer ctx)   // IN: the DnDUIX11
    ui->mHGXdndBeginTimer = 0;
    if (ui->mHGXdndLeaveAt == 0) {
       g_debug("%s: GTK did not start the drag in %ums\n", __FUNCTION__,
-              (unsigned) XDND_DRAG_BEGIN_TIMEOUT_MS);
+              (unsigned) ui->mXdndDragBeginTimeoutMs);
    }
    ui->LocalXdndLeaveDetWnd();
 
@@ -1860,7 +1933,7 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
                mHGXdndLeaveAt = 0;
                mHGXdndWaitBegin = true;
                mHGXdndBeginDeadline = g_get_monotonic_time() +
-                                      (gint64) XDND_DRAG_BEGIN_TIMEOUT_MS * 1000;
+                                      (gint64) mXdndDragBeginTimeoutMs * 1000;
                mHGXdndBeginTimer = g_timeout_add(XDND_DRAG_BEGIN_TICK_MS,
                                                  OnXdndBeginTimeout, this);
                mHGDragStarted = true;
@@ -2549,7 +2622,7 @@ DnDUIX11::OnSrcDrop()
        * stat does not return. When the placeholders could not be staged,
        * OnSrcDragBegin() added the block already, and this wait runs out.
        */
-      if (!WaylandDrag_WaitForAccept(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS)) {
+      if (!WaylandDrag_WaitForAccept(mWaylandDragAcceptTimeoutMs)) {
          /*
           * A file manager fetches the offer's contents and decides only on a
           * motion that comes after they arrive. When the pointer has already
@@ -2558,7 +2631,7 @@ DnDUIX11::OnSrcDrop()
           */
          g_debug("%s: nudging the pointer for an answer\n", __FUNCTION__);
          NudgeWaylandDrag(this);
-         if (!WaylandDrag_WaitForAccept(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS)) {
+         if (!WaylandDrag_WaitForAccept(mWaylandDragAcceptTimeoutMs)) {
             /*
              * A target that still refuses may be judging this drag on the
              * contents of an earlier one, as WaylandDrag_Refocus()
@@ -2566,7 +2639,7 @@ DnDUIX11::OnSrcDrop()
              */
             g_debug("%s: taking the drag off the target and back\n",
                     __FUNCTION__);
-            WaylandDrag_Refocus(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS,
+            WaylandDrag_Refocus(mWaylandDragAcceptTimeoutMs,
                                 NudgeWaylandDrag, this);
          }
       }
@@ -2671,7 +2744,7 @@ DnDUIX11::OnXdndReleaseTick(gpointer ctx)   // IN: the DnDUIX11
    ui->mHGXdndReleaseTicks++;
    if (!accepted &&
        now - MAX(ui->mHGXdndLeftAt, ui->mHGXdndDropAt) <
-          (gint64) XDND_DROP_ACCEPT_TIMEOUT_MS * 1000) {
+          (gint64) ui->mXdndDropAcceptTimeoutMs * 1000) {
       if (ui->mHGXdndReleaseTicks % XDND_DROP_NUDGE_TICKS == 0) {
          /* SimulateXEvents() moves to the point and a pixel beyond it. */
          ui->mDetWnd->SimulateXEvents(false, false, false, false, true,
@@ -2935,7 +3008,7 @@ DnDUIX11::OnGtkSrcDragBegin(const Glib::RefPtr< Gdk::Drag > &drag, void *ctx)
    if (this_instance->mHGXdndWaitBegin) {
       /* OnXdndBeginTimeout() moves the pointer off; see XDND_LEAVE_DELAY_MS. */
       this_instance->mHGXdndLeaveAt = g_get_monotonic_time() +
-                                      (gint64) XDND_LEAVE_DELAY_MS * 1000;
+                                      (gint64) this_instance->mXdndLeaveDelayMs * 1000;
    }
 }
 
