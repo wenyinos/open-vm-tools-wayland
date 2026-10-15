@@ -48,8 +48,11 @@ override_dh_auto_install:
 		debian/tmp/etc/xdg/autostart/vmware-user.desktop
 
 override_dh_installsystemd:
-	dh_installsystemd --name=vmtoolsd --restart-after-upgrade
+	# vgauthd has to go in first. vmtoolsd.service names it in an [Install]
+	# Also= directive, and dh_installsystemd resolves those against the
+	# buildroot, so the unit must already be there when vmtoolsd is handled.
 	dh_installsystemd --name=vgauthd --restart-after-upgrade
+	dh_installsystemd --name=vmtoolsd --restart-after-upgrade
 	dh_installsystemd --name='run-vmblock\x2dfuse'
 
 override_dh_fixperms:
