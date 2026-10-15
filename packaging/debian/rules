@@ -36,12 +36,20 @@ override_dh_auto_install:
 	install -m 0644 debian/open-vm-tools-wayland.pam \
 		debian/tmp/etc/pam.d/vmtoolsd
 
-	# Debian resolves the udev directory to /lib/udev, which is the same
-	# place as /usr/lib/udev on a merged-usr system.
+	# udev.pc reports udevdir as /lib/udev on Debian 13 and Ubuntu 26.04 but
+	# as /usr/lib/udev on Ubuntu 24.04. On a merged-usr system those are the
+	# same directory, so settle on the spelling policy prefers and package
+	# that one.
+	if [ -d debian/tmp/lib/udev ]; then
+		install -d debian/tmp/usr/lib
+		mv debian/tmp/lib/udev debian/tmp/usr/lib/udev
+		rmdir debian/tmp/lib 2>/dev/null || true
+	fi
+
 	chmod a-x debian/tmp/etc/pam.d/vmtoolsd \
 		debian/tmp/etc/vmware-tools/*.conf \
 		debian/tmp/etc/vmware-tools/vgauth/schemas/* \
-		debian/tmp/lib/udev/rules.d/99-vmware-scsi-udev.rules
+		debian/tmp/usr/lib/udev/rules.d/99-vmware-scsi-udev.rules
 
 	# The autostart entry has no use for the legacy Encoding key.
 	sed -i '/^Encoding/d' \
