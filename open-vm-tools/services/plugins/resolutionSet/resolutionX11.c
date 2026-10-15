@@ -79,6 +79,39 @@ static Bool ResolutionCanSet(void);
 static Bool TopologyCanSet(void);
 static Bool SelectResolution(uint32 width, uint32 height);
 static int ResolutionX11ErrorHandler(Display *d, XErrorEvent *e);
+static Bool ResolutionSessionIsWayland(void);
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * ResolutionSessionIsWayland --
+ *
+ *     Detects whether the desktop session runs on Wayland. This is the same
+ *     test the dndcp plugin uses, so both agree on the answer.
+ *
+ * Results:
+ *     TRUE if this is a Wayland session.
+ *
+ * Side effects:
+ *     None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+ResolutionSessionIsWayland(void)
+{
+   const char *display = g_getenv("WAYLAND_DISPLAY");
+
+   /*
+    * An X11 session that happens to export WAYLAND_DISPLAY says so in
+    * XDG_SESSION_TYPE, and a compositor started from a console leaves the
+    * type at "tty", so the variable on its own is not enough.
+    */
+   return display != NULL &&
+          g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "x11") != 0;
+}
 
 
 /*
@@ -695,6 +728,17 @@ ResolutionToolkitInit(ToolsAppCtx *ctx) // IN: For config database access
    if (fd >= 0) {
       resolutionDRMClose(fd);
       g_message("%s: Backing off for resolutionKMS.\n", __func__);
+      resInfoX->canUseResolutionKMS = TRUE;
+   } else if (ResolutionSessionIsWayland()) {
+      /*
+       * Under a Wayland session this backend only ever reaches Xwayland,
+       * whose RandR outputs are not settable. Claiming resolution_server
+       * would take the role from resolutionKMS, which can set the real
+       * outputs through DRM, and multi-monitor and resolution changes
+       * would fail silently instead. Leave the role to resolutionKMS.
+       */
+      g_message("%s: Backing off for resolutionKMS in a Wayland session.\n",
+                __func__);
       resInfoX->canUseResolutionKMS = TRUE;
    }
    return (InitHandle) resInfoX;

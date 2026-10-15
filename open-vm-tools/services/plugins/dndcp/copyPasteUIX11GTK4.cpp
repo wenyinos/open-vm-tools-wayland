@@ -525,7 +525,12 @@ CopyPasteUIX11::CopyPasteSendText(const Glib::ustring& cpStr)   // IN
       return;
    }
 
-   size_t bufSize = cpStr.size();
+   /*
+    * CPClipboard_SetItem() takes a byte count, and size() returns characters,
+    * so any text with non-ASCII in it was truncated to a character count of
+    * bytes or rejected outright. The GTK3 backend uses bytes() here.
+    */
+   size_t bufSize = cpStr.bytes();
    if (bufSize > 0  &&
        bufSize <= CPCLIPITEM_MAX_SIZE_V3 &&
        CPClipboard_SetItem(&mClipboard, CPFORMAT_TEXT,
