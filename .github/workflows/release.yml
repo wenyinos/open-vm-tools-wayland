@@ -31,8 +31,12 @@ jobs:
         distro: ['44', '45']
     steps:
       # The container images are minimal, so git has to exist before checkout.
+      # The checkout is owned by the runner user while the steps run as root,
+      # so git also has to be told to accept it.
       - name: Install git
-        run: dnf install -y git tar gzip
+        run: |
+          dnf install -y git tar gzip
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
       - name: Install build dependencies
         run: |
@@ -65,9 +69,10 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates tar gzip
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
       - name: Install packaging tools
-        run: apt-get install -y --no-install-recommends devscripts equivs
+        run: apt-get install -y --no-install-recommends devscripts equivs fakeroot
       # The tag lands in the package version, so the builds for the three
       # distributions get distinct names on the release page.
       - name: Build packages
@@ -86,7 +91,9 @@ jobs:
     container: archlinux:base-devel
     steps:
       - name: Install git
-        run: pacman -Syu --noconfirm --needed git
+        run: |
+          pacman -Syu --noconfirm --needed git
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
       - name: Build packages
         run: packaging/arch/build.sh "$PWD/dist/arch"
