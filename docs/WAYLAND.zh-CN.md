@@ -10,6 +10,7 @@ open-vm-tools 13.1.0 的原生 Wayland 后端。剪贴板与拖放在 Wayland �
 > 而多数合成器拒绝未聚焦的 Xwayland 客户端读取它。本分支补上了原生后端。
 
 - [功能概览](#功能概览)
+- [指针集成](#指针集成)
 - [各合成器支持情况](#各合成器支持情况)
 - [构建](#构建)
 - [运行前提](#运行前提)
@@ -26,10 +27,35 @@ open-vm-tools 13.1.0 的原生 Wayland 后端。剪贴板与拖放在 Wayland �
 | 拖放 客体 → 宿主 | 原生 drop target，或在 X11 源上使用 XDND |
 | 文件复制粘贴 | 客体 → 宿主直接传输；宿主 → 客体经 vmblock 惰性读取 |
 | 自动分辨率 / 多显示器 | 沿用 `resolutionKMS`，并修复其在 Wayland 下被抢占的问题 |
+| 指针集成 | 经 RemoteDesktop portal + libei，见下文「指针集成」 |
 | X11 会话 | 完全保留上游行为 |
 
 剪贴板后端会同时声明所有可用格式，因此一次复制即可让 RTF 与纯文本并存——把富文本粘贴进
 纯文本编辑器会得到纯文本，粘贴进富文本编辑器则保留格式。
+
+## 指针集成
+
+宿主需要能移动客体指针（锁定指针时把它放到宿主指定的位置），X11 下用 `XWarpPointer`
+完成。Wayland 客户端不允许自行移动或读取指针，因此改用桌面提供的 **RemoteDesktop
+portal**：它返回一个 EIS socket，由 libei 驱动，既能移动指针，也能读回设备位置。
+
+这一路径有三个必须满足的条件，都是实测得出的：
+
+1. **需要 libei**。构建时由 `pkg-config` 探测；缺失时只跳过指针集成，其余 Wayland 功能
+   照常工作（会给出警告）。安装 `libei-devel` 或对应发行版包即可启用。
+
+2. **需要一个 .desktop 文件**。portal 把授权记在"应用 ID"下，而该 ID 必须能匹配一个已安装的
+   `.desktop` 文件。本包安装 `org.openvm.tools.desktop`，插件在首次调用 portal 前注册
+   `org.openvm.tools`。**这个 ID 是本包自己的，不是任何 VMware 产品名**——权限归属本包，
+   与官方 VMware 应用互不影响。
+
+3. **首次使用会弹一次授权窗口**。授权后桌面会记住（插件请求 `persist_mode=PERSISTENT`），
+   之后登录不再询问。授权可在桌面的权限设置里查看和撤销；KDE 上对应
+   `kde-authorized` / `remote-desktop` 权限项。
+
+> **打包注意**：本包提供 `org.openvm.tools.desktop`，与官方 open-vm-tools 提供的文件
+> 不同名，因此不会互相覆盖。但两者都安装 `libdndcp.so` 等插件，**必须在包管理层面声明
+> 冲突/替代关系（`Conflicts`/`Replaces`/`Provides`），同一系统只装一个**。
 
 ## 各合成器支持情况
 
@@ -61,12 +87,13 @@ open-vm-tools 13.1.0 的原生 Wayland 后端。剪贴板与拖放在 Wayland �
 - `wayland-scanner`
 - `wayland-protocols` **>= 1.39**（`ext-data-control-v1` 从这个版本开始提供）
 - GTK 4 或 GTK 3 开发包（Wayland 后端随桌面插件一起构建）
+- `libei`（可选，用于指针集成；缺失时只跳过该功能，其余照常）
 
 Fedora / RHEL 系：
 
 ```bash
 sudo dnf install gtkmm4.0-devel libsigc++30-devel glibmm2.68-devel \
-    wayland-devel wayland-protocols-devel
+    wayland-devel wayland-protocols-devel libei-devel
 ```
 
 Debian / Ubuntu 系：
@@ -193,5 +220,24 @@ Linux 下 vmusr 日志默认写入 `/var/log/vmware-vmusr-<用户名>.log`。
 - **粘贴的文件保留宿主权限**，只读文件到客体仍是只读（上游行为）。
 - **分辨率相关的内核侧问题。** 宿主日志报 `guestScreens not congruent with hostScreens`
   时，可能是 `vmwgfx` 在 `DRM_VMW_UPDATE_LAYOUT` 后未更新已激活屏位置所致，属于内核驱动问题。
-- **未使用 libei。** 指针注入走 `/dev/uinput`（由 suid 包装器以 root 打开），功能等效，
-  但没有使用 Wayland 推荐的 libei 接口。
+- **拖放的时序常量已实测调优**，若主人的合成器时序不同导致拖放失败或启动偏慢，
+  可在 `tools.conf` 的 `[dnd]` 段调整（见下节），无需重新编译。
+
+## 拖放时序调整
+
+拖放的每一步都有等待时间，这些值是在测试过的合成器上实测确定的。不同合成器所需时间不同，
+因此可在 `/etc/vmware-tools/tools.conf` 的 `[dnd]` 段调整：
+
+```ini
+[dnd]
+# 指针在检测窗口上停留多久（Mutter 在此期间接掌 selection，过早离开会丢拖放）
+#xdndLeaveDelayMs=300
+# 等待 GTK 启动 XDND 拖放的时限
+#xdndDragBeginTimeoutMs=500
+# 原生拖放目标接受拖放的最长等待
+#waylandDragAcceptTimeoutMs=500
+# 桥接式 XDND 拖放等待目标接受的最长时限
+#xdndDropAcceptTimeoutMs=1500
+```
+
+设置非正数会被拒绝并回退到默认值（避免误写导致忙等）。不设置时行为与默认完全一致。

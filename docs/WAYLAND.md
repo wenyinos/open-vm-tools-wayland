@@ -12,6 +12,7 @@ work in both directions in a Wayland session, without falling back to an X11 ses
 > adds the native backend.
 
 - [What works](#what-works)
+- [Pointer integration](#pointer-integration)
 - [Compositor support](#compositor-support)
 - [Building](#building)
 - [Runtime requirements](#runtime-requirements)
@@ -28,11 +29,46 @@ work in both directions in a Wayland session, without falling back to an X11 ses
 | Drag guest → host | A native drop target, or XDND on X11 sources |
 | File copy and paste | Guest to host transfers directly; host to guest reads lazily through vmblock |
 | Automatic resolution / multi-monitor | Uses `resolutionKMS`, with the Wayland role conflict fixed |
+| Pointer integration | Through the RemoteDesktop portal and libei; see below |
 | X11 sessions | Upstream behaviour is preserved in full |
 
 The clipboard backend offers every format the host sent at once, so one copy
 carries RTF and plain text together: pasting rich text into a plain text editor
 yields text, and into a rich text editor keeps the formatting.
+
+## Pointer integration
+
+The host has to be able to move the guest pointer: when it grabs the pointer it
+puts it where the host says. On X11 that is `XWarpPointer`. A Wayland client may
+neither move nor read the pointer itself, so this goes through the desktop's
+**RemoteDesktop portal**, which returns an EIS socket that libei drives. That
+gives both an absolute pointer device to move and the device position to read
+back.
+
+Three things have to be in place, each of them found by running the flow:
+
+1. **libei.** Detected at configure time. When it is missing only the pointer
+   integration is left out, with a warning, and the rest of the Wayland support
+   still builds. Install `libei-devel` or the distribution's equivalent.
+
+2. **A .desktop file.** The portal remembers a grant against an application id,
+   and that id has to name an installed `.desktop` file. This package installs
+   `org.openvm.tools.desktop` and the plugin registers `org.openvm.tools` before
+   its first portal call. **The id is this package's own, not a VMware product
+   name**, so the permissions belong to this package and do not affect the
+   official VMware applications.
+
+3. **One consent dialog, once.** The grant is requested with
+   `persist_mode=PERSISTENT`, so the desktop stores it and does not ask again on
+   later logins. It can be reviewed and revoked in the desktop's permission
+   settings; on KDE it is the `kde-authorized` / `remote-desktop` entry.
+
+> **Packaging note:** the `org.openvm.tools.desktop` file this package installs
+> has a different name from the one official open-vm-tools provides, so the two
+> do not overwrite each other. Both do install the same plugin files such as
+> `libdndcp.so`, though, so the packages **must declare a conflict and a
+> replacement (`Conflicts`/`Replaces`/`Provides`) and only one may be installed
+> at a time**.
 
 ## Compositor support
 
@@ -66,12 +102,13 @@ Beyond the usual open-vm-tools dependencies you need:
 - `wayland-protocols` **>= 1.39** (`ext-data-control-v1` first appeared there)
 - A GTK 4 or GTK 3 development package (the Wayland backend is built with the
   desktop plugins)
+- `libei` (optional; without it only the pointer integration is left out)
 
 Fedora / RHEL:
 
 ```bash
 sudo dnf install gtkmm4.0-devel libsigc++30-devel glibmm2.68-devel \
-    wayland-devel wayland-protocols-devel
+    wayland-devel wayland-protocols-devel libei-devel
 ```
 
 Debian / Ubuntu:
@@ -226,6 +263,29 @@ These come from the inherited patch set and are not resolved:
   `guestScreens not congruent with hostScreens`, it may be `vmwgfx` not updating
   active screen positions after `DRM_VMW_UPDATE_LAYOUT`, which is a kernel driver
   matter.
-- **libei is not used.** Pointer injection goes through `/dev/uinput`, opened as
-  root by the suid wrapper. It is functionally equivalent, but not the interface
-  Wayland recommends.
+- **The drag timings are measured values.** If a compositor needs different
+  ones a drag can start late or be refused; they can be adjusted in the `[dnd]`
+  section of `tools.conf` (see below) without a rebuild.
+
+## Drag timing adjustments
+
+Each step of a drag waits for the step before it, and the waits were measured on
+the compositors the feature was tested with. What a compositor needs varies, so
+they can be adjusted in the `[dnd]` section of `/etc/vmware-tools/tools.conf`:
+
+```ini
+[dnd]
+# How long the pointer stays on the detection window. Mutter takes the
+# selection while it is there, so leaving earlier loses the drag.
+#xdndLeaveDelayMs=300
+# How long to wait for GTK to start an XDND drag.
+#xdndDragBeginTimeoutMs=500
+# How long a native drag target has to accept before the button goes up.
+#waylandDragAcceptTimeoutMs=500
+# How long a bridged XDND drop waits for the target to accept.
+#xdndDropAcceptTimeoutMs=1500
+```
+
+A value that is not a positive number is refused and the default is used, so a
+typo cannot turn a wait into a busy loop. With nothing set the behaviour is
+unchanged.
