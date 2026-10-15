@@ -295,6 +295,7 @@ void DnD_SetClipboardStagingDir(const char *stagingDir);
 void DnD_SetDragStagingDir(const char *stagingDir);
 void DnD_PruneStagingDirectories(void);
 void DnD_StartStagingPrune(void);
+void DnD_SetStagingPruneAgeSec(unsigned int sec);
 void DnD_StopStagingPrune(void);
 #endif
 Bool DnD_RemoveTempDirs(const char *dndTempDir, const char *prefix);

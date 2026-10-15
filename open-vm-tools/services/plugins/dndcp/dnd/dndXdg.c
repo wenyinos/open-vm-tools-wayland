@@ -411,8 +411,15 @@ FindSuitableExistingDirectory(
  * directory, and neither the clipboard nor a drag in progress uses it. See
  * PruneStagingDirectories(). A file manager copying out of the directory
  * holds the file open, and any change starts the wait again.
+ *
+ * The value comes from the plugin when it configures one and otherwise holds
+ * this default. An application may hold a dropped file for longer than the
+ * default before reading it, such as a browser upload form, so asking for a
+ * longer wait is a thing users do; see DnD_SetStagingPruneAgeSec().
  */
-#define DND_STAGING_PRUNE_AGE_SEC (2 * 60)
+#define DND_STAGING_PRUNE_AGE_SEC_DEFAULT (2 * 60)
+
+static unsigned int gStagingPruneAgeSec = DND_STAGING_PRUNE_AGE_SEC_DEFAULT;
 
 /* Deeper trees are kept, rather than walked further. */
 #define DND_STAGING_PRUNE_MAX_DEPTH 32
@@ -816,7 +823,7 @@ IsStagingName(const char *name)   // IN
  *      FindSuitableExistingDirectory(), possibly for a drag still in
  *      progress), neither the clipboard nor a drag in progress uses it (see
  *      DnD_SetClipboardStagingDir() and DnD_SetDragStagingDir()), nothing in
- *      it has changed for DND_STAGING_PRUNE_AGE_SEC, and no process holds a
+ *      it has changed for the prune age, and no process holds a
  *      file in it open or has it as its working directory. The symlink in the apparent root
  *      that points at it goes with it.
  *
@@ -835,7 +842,7 @@ PruneStagingDirectories(const char *realRoot,       // IN
 {
    char **names = NULL;
    int count = File_ListDirectory(realRoot, &names);
-   time_t cutoff = time(NULL) - DND_STAGING_PRUNE_AGE_SEC;
+   time_t cutoff = time(NULL) - gStagingPruneAgeSec;
    char **openPaths = NULL;
    int openCount = 0;
    Bool collected = FALSE;
@@ -932,6 +939,48 @@ DnD_PruneStagingDirectories(void)
        File_IsDirectory(realRoot) && File_IsDirectory(apparentRoot)) {
       PruneStagingDirectories(realRoot, apparentRoot);
    }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnD_SetStagingPruneAgeSec --
+ *
+ *      Set how long a staging directory is kept after its last change.
+ *
+ *      A staging directory is what a paste or a host to guest drag reads its
+ *      files from, so the age is how long after the transfer an application
+ *      may still open what it was given. The default suits a file manager,
+ *      which reads at once; an application that holds the path longer, such
+ *      as a browser upload form, needs a longer one and asks for it here.
+ *
+ *      A value of zero or less is refused, since it would delete a staging
+ *      directory while its transfer is still running, and the default stays
+ *      in place.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Changes when a later prune may remove a staging directory.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnD_SetStagingPruneAgeSec(unsigned int sec)  // IN: seconds to keep
+{
+   if (sec == 0) {
+      g_warning("%s: refusing a zero age, keeping %u seconds\n",
+                __FUNCTION__, gStagingPruneAgeSec);
+      return;
+   }
+   if (sec != gStagingPruneAgeSec) {
+      g_debug("%s: staging directories are kept for %u seconds\n",
+              __FUNCTION__, sec);
+   }
+   gStagingPruneAgeSec = sec;
 }
 
 

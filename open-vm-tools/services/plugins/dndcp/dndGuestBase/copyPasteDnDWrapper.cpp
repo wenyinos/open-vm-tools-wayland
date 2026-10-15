@@ -150,6 +150,31 @@ CopyPasteDnDWrapper::Init(ToolsAppCtx *ctx)
    ASSERT(p);
    p->Init(ctx);
 
+#ifdef DND_IS_XDG
+   /*
+    * How long a staging directory is kept after its last change, which is how
+    * long an application may still open what a paste or a host to guest drag
+    * gave it. The default suits a file manager, which reads at once; an
+    * application that holds the path longer, such as a browser upload form,
+    * asks for a longer one here. Both backends prune, so this is read once
+    * for whichever of them runs.
+    */
+   if (ctx != NULL && ctx->config != NULL) {
+      GError *err = NULL;
+      gint ageSec = g_key_file_get_integer(ctx->config, "dnd",
+                                           "stagingPruneAgeSec", &err);
+
+      if (err != NULL) {
+         g_clear_error(&err);
+      } else if (ageSec > 0) {
+         DnD_SetStagingPruneAgeSec((unsigned int) ageSec);
+      } else {
+         g_warning("%s: [dnd] stagingPruneAgeSec is not a positive number of "
+                   "seconds, using the default\n", __FUNCTION__);
+      }
+   }
+#endif
+
    if (!m_pimpl) {
 #if defined(HAVE_GTKMM)
 #if defined(HAVE_WAYLAND)
