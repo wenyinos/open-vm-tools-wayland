@@ -31,6 +31,11 @@
 #include <string.h>
 #include <gtk/gtk.h>
 #include <X11/Xlib.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #ifdef GTK4
 #include <gdk/x11/gdkx.h>
 #else
@@ -38,6 +43,12 @@
 #endif
 
 #define LOCK_ATOM_NAME  "vmware-user-lock"
+
+/*
+ * Name of the lock file used when there is no X display to put an X property
+ * on. See AcquireFileLock().
+ */
+#define LOCK_FILE_NAME "vmware-user.lock"
 #ifdef GTK4
 #define GDK_GET_XDISPLAY(X) gdk_x11_display_get_xdisplay(X)
 #else
@@ -400,10 +411,82 @@ out:
 
 /*
  ******************************************************************************
+ * AcquireFileLock --                                                   */ /**
+ *
+ * Takes the per-user single instance lock through a file, for sessions that
+ * have no X display to put the lock property on.
+ *
+ * The X11 path needs a display because it marks the lock on a window it owns
+ * there. A Wayland session without Xwayland has none, so the lock moves to a
+ * file in the user's runtime directory. flock() is used rather than a PID
+ * file: the kernel drops it when the process exits, including on a crash, so
+ * there is no stale lock to clean up.
+ *
+ * The descriptor is deliberately left open for the lifetime of the process,
+ * which is what holds the lock.
+ *
+ * @return TRUE if this process took the lock, FALSE if another one holds it or
+ *         the lock file could not be opened.
+ *
+ ******************************************************************************
+ */
+
+static gboolean
+AcquireFileLock(void)
+{
+   static int lockFd = -1;
+   const char *runtimeDir = g_get_user_runtime_dir();
+   gchar *path;
+   int fd;
+
+   if (lockFd != -1) {
+      /* Already held by this process. */
+      return TRUE;
+   }
+
+   if (runtimeDir == NULL) {
+      g_warning("%s: no user runtime directory to put the lock in\n", __func__);
+      return FALSE;
+   }
+   path = g_build_filename(runtimeDir, LOCK_FILE_NAME, NULL);
+   fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+   if (fd < 0) {
+      g_warning("%s: cannot open %s: %s\n", __func__, path, strerror(errno));
+      g_free(path);
+      return FALSE;
+   }
+
+   if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      /* Another vmware-user holds it. */
+      close(fd);
+      g_free(path);
+      return FALSE;
+   }
+
+   lockFd = fd;
+   g_debug("%s: took the lock file %s\n", __func__, path);
+   g_free(path);
+
+   return TRUE;
+}
+
+
+/*
+ ******************************************************************************
  * X11Lock_Init --                                                      */ /**
  *
- * Initializes GTK, and sets up a lock atom to make sure only one vmusr
- * instance is running.
+ * Initializes GTK, and sets up a lock to make sure only one vmusr instance
+ * is running.
+ *
+ * An X display is used when one is available, and the lock is then an X
+ * property so that it covers every vmusr on that display. Without a display
+ * the lock is a file instead, which covers the session the way the X display
+ * did.
+ *
+ * The session type decides: an X11 session keeps the X property, and any
+ * other session takes the file lock without touching X at all. Gtk+ is only
+ * initialized on X11, because a Wayland session may have no Xwayland and
+ * gtk_init() exits the process when it cannot open a display.
  *
  * On error, this function will request that the application's main loop stop
  * running.
@@ -425,6 +508,7 @@ X11Lock_Init(ToolsAppCtx *ctx,
    int argc = 0;
 #endif
    char *argv[] = { NULL, NULL };
+   const char *sessionType;
 
    if (!TOOLS_IS_USER_SERVICE(ctx)) {
       VMTOOLSAPP_ERROR(ctx, EXIT_FAILURE);
@@ -442,6 +526,16 @@ X11Lock_Init(ToolsAppCtx *ctx,
     */
    g_set_prgname(VMUSER_TITLE);
    argv[0] = VMUSER_TITLE;
+
+   /*
+    * Only an X11 session is locked through X. A Wayland session may have no
+    * Xwayland at all, and forcing the X11 backend plus gtk_init() there would
+    * end the process before any other plugin could run.
+    */
+   sessionType = g_getenv("XDG_SESSION_TYPE");
+   if (g_strcmp0(sessionType, "x11") != 0) {
+      return AcquireFileLock();
+   }
 
 #if GTK_MAJOR_VERSION > 3 || (GTK_MAJOR_VERSION == 3 && GTK_MINOR_VERSION >= 10)
    /*
