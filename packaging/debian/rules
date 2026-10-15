@@ -40,10 +40,10 @@ override_dh_auto_install:
 	# as /usr/lib/udev on Ubuntu 24.04. On a merged-usr system those are the
 	# same directory, so settle on the spelling policy prefers and package
 	# that one.
-	if [ -d debian/tmp/lib/udev ]; then
-		install -d debian/tmp/usr/lib
-		mv debian/tmp/lib/udev debian/tmp/usr/lib/udev
-		rmdir debian/tmp/lib 2>/dev/null || true
+	if [ -d debian/tmp/lib/udev ]; then \
+		install -d debian/tmp/usr/lib; \
+		mv debian/tmp/lib/udev debian/tmp/usr/lib/udev; \
+		rmdir debian/tmp/lib 2>/dev/null || true; \
 	fi
 
 	chmod a-x debian/tmp/etc/pam.d/vmtoolsd \
