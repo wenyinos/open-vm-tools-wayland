@@ -44,6 +44,17 @@ jobs:
           dnf builddep -y packaging/rpm/open-vm-tools-wayland.spec
       - name: Build packages
         run: packaging/rpm/build.sh "$PWD/dist/rpm"
+      - name: Verify package metadata
+        run: |
+          for f in dist/rpm/*.rpm; do
+            echo "=== $(basename "$f")"
+            rpm -qp --qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n' "$f"
+            echo "-- provides:";  rpm -qp --provides  "$f" | grep -E '^open-vm-tools' || true
+            echo "-- obsoletes:"; rpm -qp --obsoletes "$f"
+            echo "-- conflicts:"; rpm -qp --conflicts "$f"
+          done
+          echo "=== portal entry"
+          rpm -qpl dist/rpm/*desktop*.rpm | grep -E 'applications/|vmusr' || true
       - uses: actions/upload-artifact@v5
         with:
           name: rpm-fedora-${{ matrix.distro }}
@@ -79,6 +90,15 @@ jobs:
         env:
           OVT_DEB_TAG: ${{ matrix.tag }}
         run: packaging/debian/build.sh "$PWD/dist/deb"
+      - name: Verify package metadata
+        run: |
+          for f in dist/deb/*.deb; do
+            echo "=== $(basename "$f")"
+            dpkg-deb -f "$f" Package Version Architecture Provides Conflicts Replaces
+          done
+          echo "=== portal entry"
+          dpkg-deb -c dist/deb/*desktop*.deb \
+            | grep -E 'applications/|vmusr|vmware-user' || true
       - uses: actions/upload-artifact@v5
         with:
           name: deb-${{ matrix.tag }}
@@ -97,6 +117,15 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build packages
         run: packaging/arch/build.sh "$PWD/dist/arch"
+      - name: Verify package metadata
+        run: |
+          for f in dist/arch/*.pkg.tar.zst; do
+            echo "=== $(basename "$f")"
+            pacman -Qip "$f"
+          done
+          echo "=== portal entry"
+          bsdtar -tf dist/arch/*desktop*.pkg.tar.zst \
+            | grep -E 'applications/|vmusr|vmware-user' || true
       - uses: actions/upload-artifact@v5
         with:
           name: arch
