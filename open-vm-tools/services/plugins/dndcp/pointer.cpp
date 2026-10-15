@@ -132,32 +132,30 @@ PointerGetAbsoluteMouseState(void)
  *
  * PointerGetXCursorPos --
  *
- *      Return the position in pixels of the X (mouse) pointer in the root
- *      window.
+ *      Return the position in pixels of the pointer.
+ *
+ *      On X11 this is the X pointer in the root window. A Wayland client
+ *      cannot read the pointer position at all: the compositor owns the
+ *      pointer, reports it only to the surface under it, and the portal does
+ *      not expose it either. The caller is told so rather than being handed a
+ *      position that was never read, because it would otherwise report that
+ *      position to the host.
  *
  * Results:
- *      x and y coordinates.
+ *      TRUE when x and y were filled in, FALSE when the position is not
+ *      available.
  *
  * Side effects:
  *      None.
  *-----------------------------------------------------------------------------
  */
 
-void
+Bool
 PointerGetXCursorPos(int *rootX, int *rootY)
 {
 #ifdef HAVE_WAYLAND
    if (pointerUsesWayland()) {
-      /*
-       * A Wayland client cannot read the pointer position. The compositor
-       * owns the pointer and reports it only to the surface under it, and the
-       * portal does not expose it either. The host's own notion of the
-       * position, which PointerGetPos() reads, is what the caller actually
-       * needs, so report that and let the caller see no change.
-       *
-       * The values are left as the caller set them.
-       */
-      return;
+      return FALSE;
    }
 #endif
 
@@ -170,6 +168,8 @@ PointerGetXCursorPos(int *rootX, int *rootY)
 
       XQueryPointer(gXDisplay, gXRoot, &rootWin, &childWin, rootX, rootY, &x, &y, &mask);
    }
+
+   return TRUE;
 }
 
 
@@ -434,8 +434,14 @@ PointerUpdatePointerLoop(gpointer clientData) // IN: unused
             }
          }
 #else
-         PointerGetXCursorPos(&guestX, &guestY);
-         if ( hostPosX != guestX || hostPosY != guestY) {
+         /*
+          * Report where the guest pointer is, so the host knows where to put
+          * the host pointer when the guest pointer is released. A session
+          * where the position cannot be read, which is a Wayland one, has
+          * nothing to report and leaves the host's notion alone.
+          */
+         if (PointerGetXCursorPos(&guestX, &guestY) &&
+             (hostPosX != guestX || hostPosY != guestY)) {
             PointerSetPos(guestX, guestY);
          }
 #endif

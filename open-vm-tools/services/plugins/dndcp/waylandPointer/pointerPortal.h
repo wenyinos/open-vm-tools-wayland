@@ -22,12 +22,17 @@
  *    Pointer integration under Wayland, through the RemoteDesktop portal and
  *    libei.
  *
- *    A Wayland client cannot move the pointer or read its position: the
- *    protocol gives it no way to, and the compositor owns both. The desktop
- *    exposes them through the RemoteDesktop portal instead, which hands the
- *    client an EIS socket that libei drives. That is the interface intended
- *    for this, and it is shared by every compositor that implements the
- *    portal, so one code path covers all of them.
+ *    A Wayland client cannot move the pointer: the protocol gives it no way
+ *    to, and the compositor owns it. The desktop exposes the ability through
+ *    the RemoteDesktop portal, which hands the client an EIS socket that
+ *    libei drives. That is the interface intended for this, and it is shared
+ *    by every compositor that implements the portal, so one code path covers
+ *    all of them.
+ *
+ *    Reading the position back is not part of this: libei's sender context
+ *    sends events and does not receive them, and the portal does not report
+ *    the position either. A caller that needs the position cannot have it
+ *    here; see PointerGetXCursorPos() in pointer.cpp, which says so.
  *
  *    The portal asks the user to consent the first time, and the grant is
  *    remembered per application afterwards.

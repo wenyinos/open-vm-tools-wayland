@@ -40,10 +40,15 @@ yields text, and into a rich text editor keeps the formatting.
 
 The host has to be able to move the guest pointer: when it grabs the pointer it
 puts it where the host says. On X11 that is `XWarpPointer`. A Wayland client may
-neither move nor read the pointer itself, so this goes through the desktop's
+not move the pointer itself, so this goes through the desktop's
 **RemoteDesktop portal**, which returns an EIS socket that libei drives. That
-gives both an absolute pointer device to move and the device position to read
-back.
+gives an absolute pointer device to move, and the size of the area it moves in.
+
+Note that the position can be **written but not read**: libei's sender context
+sends events and does not receive them, and the portal has no position query. So
+the guest position cannot be reported back to the host on Wayland. On X11 that
+report is what lets the host place the host pointer where the guest pointer was
+when it is released; on Wayland it is absent, and nothing else depends on it.
 
 Three things have to be in place, each of them found by running the flow:
 

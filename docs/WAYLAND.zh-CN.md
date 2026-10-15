@@ -36,8 +36,12 @@ open-vm-tools 13.1.0 的原生 Wayland 后端。剪贴板与拖放在 Wayland �
 ## 指针集成
 
 宿主需要能移动客体指针（锁定指针时把它放到宿主指定的位置），X11 下用 `XWarpPointer`
-完成。Wayland 客户端不允许自行移动或读取指针，因此改用桌面提供的 **RemoteDesktop
-portal**：它返回一个 EIS socket，由 libei 驱动，既能移动指针，也能读回设备位置。
+完成。Wayland 客户端不允许自行移动指针，因此改用桌面提供的 **RemoteDesktop
+portal**：它返回一个 EIS socket，由 libei 驱动，可以移动指针并读取屏幕尺寸。
+
+注意**位置只能写、不能读**：libei 的 sender 上下文只发送事件、不接收事件，portal 也不提供
+位置查询。因此 Wayland 下无法把客体指针位置回报给宿主；X11 下这个回报用于宿主释放指针时
+把宿主指针放回对应位置，Wayland 下该回报缺失，其余功能不受影响。
 
 这一路径有三个必须满足的条件，都是实测得出的：
 
