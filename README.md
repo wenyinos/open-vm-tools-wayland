@@ -6,9 +6,23 @@
 > for what works, which compositors are supported, how to build with
 > `--with-wayland`, and the known limits.
 >
+> **Prebuilt packages:** pushing a `v*` tag builds RPM, DEB and Pacman packages
+> and publishes them on the
+> **[releases page](https://github.com/wenyinos/open-vm-tools-wayland/releases)**,
+> x86_64 only. They are named `open-vm-tools-wayland` and replace the
+> distribution `open-vm-tools`; the two cannot be installed together. See
+> **[packaging/README.md](packaging/README.md)** for the targets, the dependency
+> baseline and how the replacement works.
+>
 > **Wayland 支持：** 本分支包含原生 Wayland 后端，桌面集成（复制粘贴、拖放、文件传输）
 > 在 Wayland 会话下可用，而不再只能依赖 XWayland。功能范围、合成器支持情况、
 > `--with-wayland` 构建方式与已知限制请见 **[docs/WAYLAND.zh-CN.md](docs/WAYLAND.zh-CN.md)**。
+>
+> **预编译包：** 推送 `v*` 标签会自动构建 RPM、DEB、Pacman 三种包并发布到
+> **[Releases](https://github.com/wenyinos/open-vm-tools-wayland/releases)** 页面，
+> 仅 x86_64。包名为 `open-vm-tools-wayland`，会替换发行版自带的 `open-vm-tools`，
+> 两者不能共存。构建目标、依赖基线与替换机制见
+> **[packaging/README.md](packaging/README.md)**。
 
 ## What is the open-vm-tools project?
 open-vm-tools is a set of services and modules that enable several features in VMware products for better management of, and seamless user interactions with, guests. It includes kernel modules for enhancing the performance of virtual machines running Linux or other VMware supported Unix like guest operating systems. 
