@@ -13,18 +13,40 @@ is what makes the two unable to coexist.
 
 | Format | Built on | Needs at build time |
 | --- | --- | --- |
-| RPM | Fedora 44, Fedora 45 | `wayland-protocols >= 1.39`, `libei-devel`, `gtkmm4.0-devel`, `fuse3-devel >= 3.10` |
-| DEB | Debian 13 (trixie), Ubuntu 24.04 LTS, Ubuntu 26.04 LTS | `wayland-protocols >= 1.39`, `libei-dev`, `libgtkmm-4.0-dev`, `libfuse3-dev` |
-| Pacman | Arch Linux (rolling) | `wayland-protocols`, `libei`, `gtkmm-4.0`, `fuse3` |
+| RPM | AlmaLinux 9 | `gtkmm30-devel`, `wayland-protocols`, `fuse3-devel >= 3.10`, `libmspack-devel`, `xmlsec1-openssl-devel`, `libtirpc-devel`, `rpcgen` |
+| DEB | Ubuntu 22.04 LTS | `libgtkmm-3.0-dev`, `wayland-protocols`, `libfuse3-dev >= 3.10`, `libmspack-dev`, `libxmlsec1-dev`, `libtirpc-dev`, `rpcsvc-proto` |
+| Pacman | Arch Linux (rolling) | `gtkmm-4.0`, `wayland-protocols`, `fuse3`, `libei` |
 
-`wayland-protocols >= 1.39` is the hard floor: that release is where
-`ext-data-control-v1`, the protocol the clipboard and drag-and-drop work over,
-first appeared. The tested versions are Debian 13's 1.44, Ubuntu 24.04's 1.45
-and Ubuntu 26.04's 1.47.
+The baseline is the oldest release that has everything the build needs, so one
+package covers that release and everything newer: the EL9 RPM installs on EL10
+and on Fedora, and the 22.04 DEB installs on 24.04 and 26.04.
 
-`libei` is required by all three formats so that pointer integration is present
-in every build. Without it the rest of the Wayland support still compiles, but
-the pointer would fall back to nothing in a Wayland session.
+Two things set that floor, and both are older on EL8 and on Ubuntu 20.04:
+
+- **`libfuse3 >= 3.10`.** The fuse3 check is a hard requirement and the code
+  uses FUSE API version 35. EL8 carries fuse3 3.3 and Ubuntu 20.04 carries 3.9,
+  so neither can build Shared Folders. Relaxing this would mean either falling
+  back to FUSE 2 or dropping `vmhgfs-fuse` and `vmblock-fuse` altogether.
+- **Gtkmm 4.** It arrives with EL10, Debian 12 and Ubuntu 24.04. The desktop
+  plugins build against Gtkmm 3 or 4, and configure prefers 4 and falls back to
+  3, so the older targets build against Gtkmm 3. That is why no
+  `--with-gtk4` appears in the packaging.
+
+`wayland-protocols` carries no minimum version. `ext-data-control-v1` only
+appeared in 1.39, which EL9 (1.37) and Ubuntu 22.04 (1.25) predate, so its XML
+is kept in the tree at `services/plugins/dndcp/waylandClipboard/`. Only
+`xdg-shell` still comes from `wayland-protocols`, and that has been in its
+stable directory for far longer than any release this targets.
+
+**Pointer integration is optional, and absent from the EL9 and 22.04 builds.**
+It needs `libei` to drive the EIS socket the RemoteDesktop portal returns, and
+libei does not reach EL10, Debian 12 and Ubuntu 24.04 either. The build takes it
+when it is installed rather than requiring it: the RPM spec detects it with
+`pkg-config` and adds the build requirement and the portal desktop entry only
+when it is there, and the Debian packaging installs that entry only if the build
+produced it. Clipboard, drag-and-drop and file transfer work either way; what is
+missing without libei is the host telling the guest where to put its pointer.
+Install `libei-devel` / `libei-dev` before building to get it.
 
 ## How the replacement works
 
@@ -64,7 +86,7 @@ tree and then runs the native tooling. Run them inside the matching
 distribution; `packaging/make-tarball.sh` is shared by all three.
 
 ```sh
-# Fedora
+# EL9 and Fedora
 dnf builddep -y packaging/rpm/open-vm-tools-wayland.spec
 packaging/rpm/build.sh
 

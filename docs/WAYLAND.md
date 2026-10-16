@@ -107,7 +107,9 @@ Beyond the usual open-vm-tools dependencies you need:
 
 - `wayland-client` (libwayland-client)
 - `wayland-scanner`
-- `wayland-protocols` **>= 1.39** (`ext-data-control-v1` first appeared there)
+- `wayland-protocols`, any version: only `xdg-shell` is taken from it, because
+  `ext-data-control-v1` is kept in the tree so that releases predating
+  wayland-protocols 1.39 can still be built
 - A GTK 4 or GTK 3 development package (the Wayland backend is built with the
   desktop plugins)
 - `libei` (optional; without it only the pointer integration is left out)

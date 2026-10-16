@@ -1141,20 +1141,24 @@ fi # End of checks for X libraries
 # The dndcp plugin talks to the Wayland compositor directly for copy/paste
 # and drag and drop in a Wayland session. It needs libwayland-client, and
 # wayland-scanner and wayland-protocols to generate the protocol code.
-# ext-data-control-v1 first appeared in wayland-protocols 1.39.
+#
+# wayland-protocols is only used for xdg-shell, which has been in its stable
+# directory for far longer than any release this builds on. ext-data-control-v1
+# is not taken from there: it only appeared in wayland-protocols 1.39, so the
+# XML is kept in the tree and this builds against older releases too.
 #
 have_wayland="no"
 if test "$with_wayland" != "no"; then
    if test "$have_gtk" = "yes"; then
       PKG_CHECK_MODULES(
          [WAYLAND],
-         [wayland-client wayland-scanner wayland-protocols >= 1.39],
+         [wayland-client wayland-scanner wayland-protocols],
          [PKG_CHECK_VAR([WAYLAND_SCANNER], [wayland-scanner], [wayland_scanner])
           PKG_CHECK_VAR([WAYLAND_PROTOCOLS_DATADIR], [wayland-protocols], [pkgdatadir])
           have_wayland="yes"],
          [AS_IF([test "$with_wayland" = "auto"],
-                [AC_MSG_WARN([wayland-client, wayland-scanner or wayland-protocols >= 1.39 not found. The dndcp plugin will be built without native Wayland support.])],
-                [AC_MSG_ERROR([wayland-client, wayland-scanner or wayland-protocols >= 1.39 not found. Please install the wayland and wayland-protocols devel packages, or configure using --without-wayland.])])])
+                [AC_MSG_WARN([wayland-client, wayland-scanner or wayland-protocols not found. The dndcp plugin will be built without native Wayland support.])],
+                [AC_MSG_ERROR([wayland-client, wayland-scanner or wayland-protocols not found. Please install the wayland and wayland-protocols devel packages, or configure using --without-wayland.])])])
    elif test "$with_wayland" = "yes"; then
       AC_MSG_ERROR([Wayland support needs Gtk+ support. Please configure with Gtk+, or using --without-wayland.])
    fi

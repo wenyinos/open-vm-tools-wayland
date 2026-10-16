@@ -9,6 +9,9 @@
 	dh $@
 
 override_dh_auto_configure:
+	# No --with-gtk4: configure prefers Gtkmm 4 and falls back to Gtkmm 3,
+	# which is what the older releases this targets carry. Gtkmm 4 does not
+	# reach Debian until 12 and Ubuntu until 24.04.
 	dh_auto_configure -- \
 		--disable-static \
 		--disable-docs \
@@ -16,7 +19,6 @@ override_dh_auto_configure:
 		--enable-servicediscovery \
 		--enable-vmwgfxctrl \
 		--with-fuse \
-		--with-gtk4 \
 		--with-tirpc \
 		--with-wayland \
 		--with-xmlsec1 \
@@ -54,6 +56,17 @@ override_dh_auto_install:
 	# The autostart entry has no use for the legacy Encoding key.
 	sed -i '/^Encoding/d' \
 		debian/tmp/etc/xdg/autostart/vmware-user.desktop
+
+	# The portal desktop entry names the app id the RemoteDesktop portal
+	# resolves, so it only exists when the build found libei. Move it into
+	# the desktop package here, because dh_install refuses a list entry that
+	# matches nothing.
+	if [ -f debian/tmp/usr/share/applications/org.openvm.tools.desktop ]; then \
+		install -D -m 0644 \
+			debian/tmp/usr/share/applications/org.openvm.tools.desktop \
+			debian/open-vm-tools-wayland-desktop/usr/share/applications/org.openvm.tools.desktop; \
+		rm -f debian/tmp/usr/share/applications/org.openvm.tools.desktop; \
+	fi
 
 override_dh_installsystemd:
 	# vgauthd has to go in first. vmtoolsd.service names it in an [Install]

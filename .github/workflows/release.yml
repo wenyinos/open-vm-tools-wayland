@@ -24,11 +24,13 @@ jobs:
   rpm:
     name: RPM (Fedora ${{ matrix.distro }})
     runs-on: ubuntu-latest
-    container: registry.fedoraproject.org/fedora:${{ matrix.distro }}
+    container: almalinux:${{ matrix.distro }}
     strategy:
       fail-fast: false
       matrix:
-        distro: ['44', '45']
+        # EL9 is the oldest release with everything the build needs, and its
+        # packages install on EL10 and on Fedora as well.
+        distro: ['9']
     steps:
       # The container images are minimal, so git has to exist before checkout.
       # The checkout is owned by the runner user while the steps run as root,
@@ -41,7 +43,17 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False rpm-build dnf-plugins-core
+          # CodeReady Builder carries rpcgen and several of the -devel packages.
+          dnf config-manager --set-enabled crb
           dnf builddep -y packaging/rpm/open-vm-tools-wayland.spec
+      # Gtkmm 4 and libei are not in EL9. The build takes them when they are
+      # there, so ask for them and carry on if the release does not have them.
+      - name: Install optional build dependencies
+        run: |
+          for p in gtkmm4.0-devel libei-devel; do
+            dnf install -y --setopt=install_weak_deps=False "$p" \
+              || echo "optional dependency $p is not available on this release"
+          done
       - name: Build packages
         run: packaging/rpm/build.sh "$PWD/dist/rpm"
       - name: Verify package metadata
@@ -57,7 +69,7 @@ jobs:
           rpm -qpl dist/rpm/*desktop*.rpm | grep -E 'applications/|vmusr' || true
       - uses: actions/upload-artifact@v5
         with:
-          name: rpm-fedora-${{ matrix.distro }}
+          name: rpm-el${{ matrix.distro }}
           path: dist/rpm/*.rpm
           if-no-files-found: error
 
@@ -69,12 +81,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: debian:13
-            tag: debian13
-          - image: ubuntu:24.04
-            tag: ubuntu2404
-          - image: ubuntu:26.04
-            tag: ubuntu2604
+          # 22.04 is the oldest release with everything the build needs: Gtkmm 4
+          # arrives in 24.04, and libfuse3 3.10, which the fuse3 check requires,
+          # in 22.04. Its packages install on 24.04 and 26.04 as well.
+          - image: ubuntu:22.04
+            tag: ubuntu2204
     steps:
       - name: Install git
         run: |
@@ -84,7 +95,15 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install packaging tools
         run: apt-get install -y --no-install-recommends devscripts equivs fakeroot
-      # The tag lands in the package version, so the builds for the three
+      # Gtkmm 4 and libei are not in 22.04. The build takes them when they are
+      # there, so ask for them and carry on if the release does not have them.
+      - name: Install optional build dependencies
+        run: |
+          for p in libgtkmm-4.0-dev libei-dev; do
+            apt-get install -y --no-install-recommends "$p" \
+              || echo "optional dependency $p is not available on this release"
+          done
+      # The tag lands in the package version, so builds for several
       # distributions get distinct names on the release page.
       - name: Build packages
         env:

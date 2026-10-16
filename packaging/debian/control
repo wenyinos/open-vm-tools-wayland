@@ -7,11 +7,10 @@ Build-Depends:
  automake,
  debhelper-compat (= 13),
  libdrm-dev,
- libei-dev,
  libfuse3-dev,
  libglib2.0-dev,
- libgtk-4-dev,
- libgtkmm-4.0-dev,
+ libgtk-3-dev,
+ libgtkmm-3.0-dev,
  libltdl-dev,
  libmspack-dev,
  libpam0g-dev,
@@ -30,7 +29,7 @@ Build-Depends:
  libtool,
  pkg-config,
  rpcsvc-proto,
- wayland-protocols (>= 1.39)
+ wayland-protocols
 Standards-Version: 4.6.2
 Homepage: https://github.com/wenyinos/open-vm-tools-wayland
 Rules-Requires-Root: binary-targets

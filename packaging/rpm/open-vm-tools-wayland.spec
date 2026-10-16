@@ -24,6 +24,18 @@
 # debugsource packages the build would otherwise produce.
 %global debug_package %{nil}
 
+#
+# libei is what drives the EIS socket the RemoteDesktop portal returns, and so
+# what the pointer integration rests on. Not every release has it: EL9 does
+# not, it arrives with EL10. Rather than require it, the build takes it when it
+# is installed; configure then defines HAVE_LIBEI, and the package picks up the
+# pointer integration and the portal desktop entry that goes with it.
+#
+# Detect it here rather than on the distribution name, so this stays correct on
+# a release the spec has never seen.
+#
+%global have_libei %(pkg-config --exists libei-1.0 2>/dev/null && echo 1 || echo 0)
+
 %{!?srcname:     %global srcname open-vm-tools-13.1.0-25218885}
 %{!?toolsversion: %global toolsversion 13.1.0}
 
@@ -72,20 +84,28 @@ BuildRequires:  pkgconfig(glib-2.0) >= 2.34.0
 BuildRequires:  pkgconfig(gmodule-2.0) >= 2.34.0
 BuildRequires:  pkgconfig(gobject-2.0) >= 2.34.0
 BuildRequires:  pkgconfig(gthread-2.0) >= 2.34.0
-BuildRequires:  pkgconfig(gtk4) >= 4.0.0
-BuildRequires:  pkgconfig(gtkmm-4.0) >= 4.0.0
+# The desktop plugins build against Gtk+ 3 or 4, whichever the release has;
+# configure prefers 4 and falls back to 3. Gtkmm 3 is the floor because every
+# release this targets carries it. Gtkmm 4 is used when it happens to be
+# installed, so it is deliberately not required here.
+BuildRequires:  pkgconfig(gtkmm-3.0) >= 3.0.0
 BuildRequires:  pkgconfig(libdrm)
-BuildRequires:  pkgconfig(libei-1.0)
 BuildRequires:  pkgconfig(libmspack) >= 0.0.20040308alpha
 BuildRequires:  pkgconfig(libudev)
 BuildRequires:  pkgconfig(libtirpc)
 BuildRequires:  pkgconfig(openssl)
 BuildRequires:  pkgconfig(wayland-client)
-BuildRequires:  pkgconfig(wayland-protocols) >= 1.39
+# Only xdg-shell is taken from wayland-protocols, so no minimum version: the
+# other protocols are kept in the tree.
+BuildRequires:  pkgconfig(wayland-protocols)
 BuildRequires:  rpcgen
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  systemd-udev
 BuildRequires:  xmlsec1-openssl-devel
+
+%if %{have_libei}
+BuildRequires:  pkgconfig(libei-1.0)
+%endif
 
 Requires:       coreutils
 Requires:       pkgconfig
@@ -96,9 +116,9 @@ guest report its status to the host, synchronise its clock, resize its
 display, and share the clipboard and dragged files with the host.
 
 This build is the upstream 13.1.0 release plus the Wayland work: clipboard and
-drag-and-drop over the Wayland data-control protocols, and pointer integration
-through the XDG RemoteDesktop portal and libei. The X11 paths are unchanged and
-are still used in an X11 session.
+drag-and-drop over the Wayland data-control protocols, and, where libei is
+available, pointer integration through the XDG RemoteDesktop portal. The X11
+paths are unchanged and are still used in an X11 session.
 
 It installs the same binaries and plugins as the distribution package, so it
 replaces it rather than living beside it.
@@ -127,7 +147,6 @@ autoreconf -vif
     --enable-servicediscovery \
     --enable-vmwgfxctrl \
     --with-fuse \
-    --with-gtk4 \
     --with-tirpc \
     --with-wayland \
     --with-xmlsec1 \
@@ -274,8 +293,10 @@ fi
 %{_libdir}/%{toolsname}/plugins/vmusr/
 %{_unitdir}/run-vmblock\x2dfuse.mount
 # The RemoteDesktop portal resolves the app id below to this entry, so the
-# pointer integration cannot work without it.
+# pointer integration cannot work without it. Only the libei build installs it.
+%if %{have_libei}
 %{_datadir}/applications/org.openvm.tools.desktop
+%endif
 
 %changelog
 * Thu Oct 15 2026 Wenyin Root <wenyinos@users.noreply.github.com> - 13.1.0-1

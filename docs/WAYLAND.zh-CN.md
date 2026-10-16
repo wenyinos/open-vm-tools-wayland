@@ -90,7 +90,8 @@ portal**：它返回一个 EIS socket，由 libei 驱动，可以移动指针并
 
 - `wayland-client`（libwayland-client）
 - `wayland-scanner`
-- `wayland-protocols` **>= 1.39**（`ext-data-control-v1` 从这个版本开始提供）
+- `wayland-protocols`，不限版本：只从它取 `xdg-shell`，因为 `ext-data-control-v1`
+  已内嵌在源码树中，这样早于 wayland-protocols 1.39 的发行版也能构建
 - GTK 4 或 GTK 3 开发包（Wayland 后端随桌面插件一起构建）
 - `libei`（可选，用于指针集成；缺失时只跳过该功能，其余照常）
 
