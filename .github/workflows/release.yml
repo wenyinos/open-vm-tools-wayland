@@ -22,7 +22,7 @@ defaults:
 
 jobs:
   rpm:
-    name: RPM (Fedora ${{ matrix.distro }})
+    name: RPM (EL${{ matrix.distro }})
     runs-on: ubuntu-latest
     container: almalinux:${{ matrix.distro }}
     strategy:

@@ -1726,18 +1726,31 @@ PointerAxisDiscrete(void *data, struct wl_pointer *pointer, uint32_t axis,
 }
 
 
+/*
+ * wl_pointer grew these two events after the releases this builds on:
+ * axis_value120 with wl_pointer version 8 and axis_relative_direction with
+ * version 9. Both the handler and its entry in the listener have to be left
+ * out when the installed headers predate them, or the initializer names a
+ * member that is not in the struct and the build stops. The generated header
+ * only defines the SINCE_VERSION macro for an event it knows about, which is
+ * what makes this exact rather than a guess at library versions.
+ */
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
 static void
 PointerAxisValue120(void *data, struct wl_pointer *pointer, uint32_t axis,
                     int32_t value120)
 {
 }
+#endif
 
 
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
 static void
 PointerAxisRelativeDirection(void *data, struct wl_pointer *pointer,
                              uint32_t axis, uint32_t direction)
 {
 }
+#endif
 
 
 static const struct wl_pointer_listener gPointerListener = {
@@ -1750,8 +1763,12 @@ static const struct wl_pointer_listener gPointerListener = {
    .axis_source = PointerAxisSource,
    .axis_stop = PointerAxisStop,
    .axis_discrete = PointerAxisDiscrete,
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
    .axis_value120 = PointerAxisValue120,
+#endif
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
    .axis_relative_direction = PointerAxisRelativeDirection,
+#endif
 };
 
 
